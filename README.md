@@ -31,12 +31,7 @@ Instead of clustering a global chromatin interaction graph, PEhub:
 
 > 📌 **Figure**:
 > A schematic overview of the PEhub workflow is shown below.
-
-```
-docs/PEhub_overview.png
-```
-
-(Replace this path with your actual figure location.)
+![PEhub workflow overview](docs/PEhub_overview.png)
 
 ---
 
@@ -47,7 +42,7 @@ PEhub is distributed as a single R script with a fully reproducible **Conda envi
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YidanSunResearchLab/PEhub
+git clone https://github.com/YidanSunResearchLab/PEhub.git
 cd PEhub
 ```
 

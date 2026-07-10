@@ -1,0 +1,146 @@
+---
+title: "PEhub: detecting multi-way enhancer hubs"
+author: "Yidan Sun"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 2
+vignette: >
+  %\VignetteIndexEntry{PEhub}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, collapse = TRUE, comment = "#>")
+```
+
+# Introduction
+
+Chromatin interaction assays such as HiChIP record enhancer–promoter contacts one
+pair at a time. Within a single cell, proximity ligation joins a promoter to only
+one of its enhancers, so a hub of several enhancers engaging the same promoter is
+fragmented across the cell population into overlapping pairwise contacts.
+
+`r Biocpkg("PEhub")` reconstructs those hubs from the pairwise data.
+
+# Installation
+
+```{r}
+remotes::install_github("yourname/PEhub")
+```
+
+No Python configuration is required. The Leiden backend is provisioned
+automatically by `r Biocpkg("basilisk")` on first use.
+
+# Preparing the annotation
+
+`pehub_prepare_interactions()` needs a `GRanges` of transcription start sites
+with a `gene_id` metadata column.
+
+```{r}
+library(PEhub)
+
+gtf <- rtracklayer::import("genes.gtf.gz")
+tss <- GenomicRanges::resize(gtf[gtf$type == "transcript"],
+                             width = 1, fix = "start")
+```
+
+Alternatively, if you have the relevant annotation packages installed:
+
+```{r}
+tss <- build_tss_from_txdb()   # defaults to hg38 knownGene
+```
+
+# Running the whole pipeline
+
+```{r}
+result <- pehub_run(
+  loop_file     = "significant_interactions.bedpe",
+  loop_file_all = "all_interactions.bedpe.gz",
+  outdir        = "results/",
+  tss_input     = tss,
+  filename      = "GM12878",
+  workers       = 10
+)
+
+head(result$high_confidence)
+```
+
+# Running the stages separately
+
+Each stage returns its key objects, so intermediate results can be inspected
+without loading any files.
+
+## Stage 1: prepare interactions
+
+```{r}
+prep <- pehub_prepare_interactions(
+  loop_file       = "significant_interactions.bedpe",
+  loop_file_all   = "all_interactions.bedpe.gz",
+  outdir          = "results/",
+  tss_input       = tss,
+  filename        = "GM12878"
+)
+```
+
+## Stage 2: detect candidate hubs
+
+```{r}
+hubs <- pehub_detect_hubs(
+  outdir        = "results/",
+  filename      = "GM12878",
+  weight_method = "bin_log_ratio_sig",
+  resolution    = 1.0,
+  k_min         = 3
+)
+
+nrow(hubs$hub1)   # one candidate hub per promoter
+```
+
+## Stage 3: evaluate hubs
+
+```{r}
+ev <- pehub_evaluate_hubs(
+  outdir      = "results/",
+  filename    = "GM12878",
+  B_pvalue    = 1000,
+  B_stability = 10
+)
+
+summary(ev$hub1$hub_p_value_global)
+summary(ev$hub1$reproducibility_rate)
+```
+
+## Stage 4: classify and export
+
+```{r}
+out <- pehub_export_hubs(
+  outdir           = "results/",
+  filename         = "GM12878",
+  pvalue_cutoff    = 0.05,
+  stability_cutoff = 0.5
+)
+
+out$files
+```
+
+# Choosing a weighting scheme
+
+Eleven schemes are available, combining contact count, statistical significance
+and genomic distance in different ways.
+
+```{r}
+pehub_weight_schemes()
+```
+
+The default, `bin_log_ratio_sig` ("Distance-adjusted log-enrichment"), scores each
+contact by the log ratio of its observed count to the median count at the same
+genomic distance, scaled by significance. This makes the weight dimensionless and
+comparable across distance scales.
+
+# Session info
+
+```{r, eval=TRUE}
+sessionInfo()
+```

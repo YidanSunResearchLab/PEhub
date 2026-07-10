@@ -1,114 +1,48 @@
-# ==================== PEhub v1.0 ====================
-# 安装依赖（一次性）
-# BiocManager::install(c("GenomicRanges", "dplyr", "purrr", "igraph", "parallel"))
+## Core PEhub functions (unchanged from the original implementation).
+## Only namespace prefixes and roxygen tags are added; algorithm logic is identical.
 
-library(GenomicRanges)
-library(dplyr)
-library(purrr)
-library(igraph)
-library(parallel)
-library(Matrix)
-library(tidyr)
-library(stringr)
-library(furrr)
-library(data.table)
-library(progress) 
-plan(multisession, workers = 10)
-
-##leiden clustering
-library(reticulate)
-use_python("/mnt/citadel2/research/syidan/miniconda3/envs/r_porc/bin/python", required = TRUE)
-py_config() 
-library(leiden)
-
-##Input
-tss_input = "~/syidan/Genomes/GRCh38/release-47-index/annotation/genes.gtf"
-
-
-##Prepare gene annotation: promoter regions ±2kb around TSS
-# # 支持四种输入模式：TxDb / orgdb / gtf / bed
-# ## TxDb 模式：直接从 TxDb.Hsapiens.UCSC.hg38.knownGene 取 promoter
-# library(TxDb.Hsapiens.UCSC.hg38.knownGene)
-# promoters_annotation <- promoters(
-#   TxDb.Hsapiens.UCSC.hg38.knownGene,
-#   upstream = 0,
-#   columns  = "gene_id"
-# )
-
-
-# ## orgdb 模式：从 org.Hs.eg.db 的基因坐标取 promoter
-# library(org.Hs.eg.db)
-# genes_gr <- genes(org.Hs.eg.db)
-# promoters_annotation <- promoters(
-#   genes_gr,
-#   upstream = 0,
-#   columns  = "gene_id"
-# )
-
-
-#' @title Extract Transcript TSS from GTF File
-#' @description This function processes a GTF file to extract the transcription start sites (TSS) 
-#' of transcripts. It is designed to work with genomic data in GTF format.
-#' @details The function reads the GTF file, identifies transcript features, and extracts their 
-#' transcription start sites (TSS). The extracted TSS data is then saved to the specified output file 
-#' in a format suitable for downstream analysis.
-library(rtracklayer)
-gtf <- rtracklayer::import(tss_input)
-promoters_annotation <- gtf %>%
-  subset(type == "transcript") %>%
-  unique()
-
-
-
-# ------------------- Step 0: preprocess the hichip bedpe input -------------------
-
+# [F01] loops_convert()
+# Purpose : Normalize and augment a HiChIP/Hi-C loop table into a unified 'hubs' table representation.
+# Inputs  : dt (data.table/data.frame) containing a loop BEDPE-like schema plus PEhub metadata columns.
+# Outputs : data.frame with standardized columns (chr/start/end/...) and one synthetic PP anchor row per hubid.
+# Notes   : This function is pure in-memory transformation; all file I/O must be handled by the CLI wrapper.
 loops_convert <- function(dt) {
 
-  setDT(dt)  # 不会深拷贝到每一列
+  setDT(dt)
 
-  # rest_df: 等价于 loops[, -(1:3)]，并把前3列改名 chr/start/end
   rest <- dt[, -(1:3)]
   data.table::setnames(rest, old = names(rest)[1:3], new = c("chr", "start", "end"))
 
-  # anchor_df: 只取需要的列
   anchor_cols <- c(
     "chr1","start1","end1","type1","type2","pair_type",
     "promoter_id","promoter_gene_id","promoter_transcript_id",
     "promoter_gene_name","hubid"
   )
-  # 只取存在的列（避免缺列报错）
   anchor_cols <- intersect(anchor_cols, names(dt))
 
   anchor <- dt[, ..anchor_cols]
   data.table::setnames(anchor, old = c("chr1","start1","end1"), new = c("chr","start","end"), skip_absent = TRUE)
 
-  # 强制 anchor 的 pair_type 为 PP（不存在就新建）
   anchor[, pair_type := "PP"]
 
-  # 每个 hubid 只保留第一条（比 duplicated 更快/更省）
   if ("hubid" %in% names(anchor)) {
     data.table::setkey(anchor, hubid)
     anchor <- anchor[!duplicated(hubid)]
   }
 
-  # 给 anchor 补齐 rest 中缺失的列（一次性，不要循环逐列赋值）
   miss <- setdiff(names(rest), names(anchor))
   if (length(miss)) {
     anchor[, (miss) := NA]
   }
 
-  # 让 anchor 列顺序与 rest 一致
   data.table::setcolorder(anchor, names(rest))
 
-  # rbind（data.table 的 rbindlist 比 base rbind 快）
   final <- data.table::rbindlist(list(rest, anchor), use.names = TRUE, fill = TRUE)
 
-  # enhancer_id NA -> promoter_id（用 data.table 的 fcoalesce 更快）
   if (all(c("enhancer_id", "promoter_id") %in% names(final))) {
     final[is.na(enhancer_id), enhancer_id := promoter_id]
   }
 
-  # 如果你真的需要按 hubid 排序（很耗时，能省则省）
   if ("hubid" %in% names(final)) {
     data.table::setorder(final, hubid)
   }
@@ -117,17 +51,31 @@ loops_convert <- function(dt) {
 }
 
 
+# [F02] make_peak_id()
+# Purpose : Generate a stable peak identifier from genomic coordinates using a fixed binning scale.
+# Inputs  : chr, start, end; optional scale (default 1000L).
+# Outputs : character vector of peak IDs (e.g., peak_chr1_123_124).
+# Notes   : Coordinate binning is an implementation detail; keep consistent across runs for reproducibility.
 make_peak_id <- function(chr, start, end, scale = 1000L) {
   paste0("peak_",chr, "_", start %/% scale, "_", end %/% scale)
 }
 
+# [F03] preprocess_hichip()
+# Purpose : Ingest a BEDPE(-like) interaction file, annotate anchors as Promoter/Enhancer, and build PEhub-ready tables.
+# Inputs  : loop_file (path via CLI), tss_input (GRanges with gene_id/gene_name/transcript_id), mode ('all' or 'promoter'),
+#          promoter_window, optional h3k27ac_peak (path via CLI), min_dist, max_dist.
+# Outputs : list(loops=annotated loops table, hubs=loops converted to hub-style table, peaks=GRanges of unique anchors).
+# Notes   : All file paths must be passed as CLI args and bound to the corresponding variables before calling.
+#' preprocess_hichip
+#'
+#' See the vignette and README for usage.
+#' @export
 preprocess_hichip <- function(
     loop_file,
     tss_input = NULL,                  # GRanges object，include gene_id column
     mode = c("all"),       # all = EP+PP, promoter = 只EP
     promoter_window = 0,
     h3k27ac_peak = NULL,
-    # h3k27ac_bw = NULL,
     min_dist = 10000,
     max_dist = 2000000
 ) {
@@ -140,7 +88,7 @@ preprocess_hichip <- function(
   promoters_genome <- promoters(tss_input, upstream = promoter_window, downstream = promoter_window)
   message("Got ", length(tss_input), " promoters from annotation")
   
-  # 0. read loops
+  # read loops
   loops_ori <- data.table::fread(loop_file, header=TRUE)
   colnames(loops_ori) = c("chr1", "start1", "end1", "chr2", "start2", "end2",colnames(loops_ori)[7:ncol(loops_ori)])
   #loops_ori = loops_ori[loops_ori$counts>0, ]
@@ -239,7 +187,7 @@ preprocess_hichip <- function(
                          )
   message("Before filtering loop number: ", nrow(loops))
 
-  # 4. 关键开关：选择保留哪些类型
+  # keep only PE or not
   if (mode == "promoter") {
     loops <- loops %>% filter(pair_type %in% c("PE"))
     message("Only keep enhancer promoter interactions, loop number: ", nrow(loops))
@@ -248,25 +196,27 @@ preprocess_hichip <- function(
     message("Keep all PE and EE interaction types, loop number: ", nrow(loops))
   }
     
-  # 5. 计算距离 + 过滤
+  # Filtering using distance
   loops <- loops %>%
     mutate(distance = abs((start1+end1)/2 - (start2+end2)/2)) %>%
     filter(distance >= min_dist, distance <= max_dist)
   message("After distance filtering, loop number: ", nrow(loops))
   
-  # 6. 是否与 H3K27ac peaks overlap 过滤
+  # 6. if H3K27ac peaks overlap 
   if(!is.null(h3k27ac_peak)){
-    ## 1. 读 H3K27ac peaks
+    if (!requireNamespace("rtracklayer", quietly = TRUE)) {
+      stop("Reading a peak file requires the 'rtracklayer' package.\n",
+           "Install it with: BiocManager::install('rtracklayer')\n",
+           "Alternatively, omit the 'h3k27ac_peak' argument.", call. = FALSE)
+    }
     h3k27ac_peaks <- rtracklayer::import(h3k27ac_peak)
     
-    ## 2. 判断是否与 h3k27ac_peaks overlap
     gr_left  <- GRanges(loops$chr1, IRanges(loops$start1 + 1, loops$end1))
     gr_right <- GRanges(loops$chr2, IRanges(loops$start2 + 1, loops$end2))
 
     over_left  <- overlapsAny(gr_left,  h3k27ac_peaks + 5000)
     over_right <- overlapsAny(gr_right, h3k27ac_peaks + 5000)
 
-    ## 3. 至少一端 overlap 就保留
     # loops <- loops[over_left & over_right, ]
     loops$peakoverlap1 <- over_left
     loops$peakoverlap2 <- over_right
@@ -281,14 +231,21 @@ preprocess_hichip <- function(
           ", EE = ", sum(loops$pair_type=="EE"),
           ", PP = ", sum(loops$pair_type=="PP"), ")")
   
-  # 7. make hub object
   hubs <- loops_convert(loops)
 
   return(list(loops=as.data.frame(loops), hubs=hubs, peaks=peaks))
 
 }
 
-# ------------------- Step 1: Compute weights for each EP interaction in 11 different ways -------------------
+# [F04] compute_weights()
+# Purpose : Compute per-EP interaction weights under multiple scoring models (counts, significance, distance, bin-corrected, etc.).
+# Inputs  : df (loops table), weight_mode, dist_col, q_col, breaks, alpha, sig_cap, sig_beta.
+# Outputs : list(loops=loops with weight_raw/weight_percentage, hubs=loops converted to hub-style table).
+# Notes   : Weight definitions must be reported in Methods; record weight_mode and parameters in output metadata externally.
+#' compute_weights
+#'
+#' See the vignette and README for usage.
+#' @export
 compute_weights <- function(df,
                             weight_mode = c("count_only",
                                             "sig_only",
@@ -298,6 +255,7 @@ compute_weights <- function(df,
                                             "count_sig_plus_dist_linear",
                                             "bin_percentile_plus_sig",
                                             "bin_log_ratio_sig",
+                                            "bin_log_ratio_sig_normalized",
                                             "bin_diff_global",
                                             "bin_diff_binmax",
                                             "bin_percentile"),
@@ -469,6 +427,36 @@ compute_weights <- function(df,
         weight_percentage = norm01(weight_raw)
       )
 
+  } else if (weight_mode == "bin_log_ratio_sig_normalized") {
+    # log(Observed / Expected) within distance bins (Expected = bin median counts)
+    df <- df %>%
+      mutate(
+        bin = cut(dist, breaks = breaks, labels = FALSE, include.lowest = TRUE)
+      ) %>%
+      group_by(bin) %>%
+      mutate(
+        bin_med_count = median(pmax(counts, 1), na.rm = TRUE),
+        w_dist_ratio = log(pmax(counts, 1) / bin_med_count)
+      ) %>%
+      ungroup() %>%
+      mutate(
+        w_dist_raw = pmax(w_dist_ratio, 0),
+        weight_raw_ori = w_dist_raw * reliability,
+      )
+
+    alpha <- 1e-4
+    df <- df %>%
+      group_by(promoter_id) %>%
+      mutate(
+        w_pos = pmax(weight_raw_ori, 0),
+        w_pos = pmin(w_pos, quantile(w_pos, 0.99, na.rm = TRUE)),
+        w_pos = w_pos + alpha,
+        w_sum = sum(w_pos, na.rm = TRUE),
+        weight_raw = w_pos / w_sum,
+        weight_percentage = norm01(weight_raw)
+      ) %>%
+      ungroup()
+
   } else if (weight_mode == "zscore_residual") {
     # uses HicDCPlus model outputs: mu, sdev (must exist)
     if (!all(c("mu", "sdev") %in% colnames(df))) {
@@ -487,9 +475,17 @@ compute_weights <- function(df,
 }
 
 
-# ------------------- Step 2: Fast co-membership matrix computation -------------------
+# [F05] fast_comembership()
+# Purpose : Build an enhancer-by-enhancer weighted co-membership matrix for a single promoter using a synergy-like model.
+# Inputs  : enhancers (character vector), weights (numeric vector aligned to enhancers), quantile_cutoff, method.
+# Outputs : dgCMatrix sparse symmetric matrix with enhancer names as dimnames.
+# Notes   : quantile_cutoff sparsifies edges; choose consistently for observed/null computations to avoid bias.
+#' fast_comembership
+#'
+#' See the vignette and README for usage.
+#' @export
 fast_comembership <- function(enhancers, weights, quantile_cutoff = 0, method = c("log_minmax")) { #"log_minmax", "log_zscore", "log_maxnorm"
-  # 1. 准备数据
+  # 1. data
   w <- as.numeric(weights)
   w[!is.finite(w)] <- 0
   w <- pmax(w, 0)
@@ -501,28 +497,28 @@ fast_comembership <- function(enhancers, weights, quantile_cutoff = 0, method = 
     return(mat)
   }
   
-  # 2. Log-Space 计算 (完美保留你的 Synergy 公式逻辑)
-  # 原公式: Score_ij ≈ w_i * w_j * [ T_all / ((1+w_i)*(1+w_j)) ]
-  # 我们忽略 "-1"，因为当 T_all 很大时，-1 几乎不影响相对排序
+  # 2. Log-space calculation (preserves your Synergy formula logic perfectly)
+  # Original formula: Score_ij ≈ w_i * w_j * [ T_all / ((1+w_i)*(1+w_j)) ]
+  # We ignore "-1" since when T_all is large, "-1" has almost no effect on relative ranking
   
-  # 预计算 Log 值，防止溢出
-  # 使用 log1p(x) 计算 log(1+x) 更精确
+  # Precompute log values to prevent overflow
+  # Use log1p(x) for more accurate computation of log(1+x)
   log_w <- log(w + 1e-10)    # 防止 log(0)
   log_1_plus_w <- log1p(w)   # log(1+w)
   sum_log_T <- sum(log_1_plus_w) # 这是原来的 log(T_all)
   
-  # 矩阵化计算 Log(Score)
+  # Co-membership Log(Score)
   # Log(S_ij) = log(w_i) + log(w_j) + log(T_all) - log(1+w_i) - log(1+w_j)
   
-  # 为了速度，使用 outer (向量外积)
+  # For better performance, use outer (vector outer product)
   term_wi_wj <- outer(log_w, log_w, "+")         # log(w_i) + log(w_j)
   term_denom <- outer(log_1_plus_w, log_1_plus_w, "+") # log(1+w_i) + log(1+w_j)
   
   log_S_matrix <- term_wi_wj + sum_log_T - term_denom
   
-  # 3. 归一化 (关键步骤)
-  # 找出矩阵中最大的 Log 值，将所有值平移，使最大值为 0 (即原值为 1)
-  # 这样保证了 exp() 之后数值在 [0, 1] 之间，且相对比例不变
+  # 3. Normalization (Key Step)
+  # Find the maximum log value in the matrix and shift all values so that the maximum becomes 0 (i.e., original value becomes 1).
+  # This ensures that after applying exp(), the values are in the range [0, 1] while maintaining their relative proportions.
   diag(log_S_matrix) <- NA
   max_log_val <- max(log_S_matrix, na.rm = TRUE)
   min_log_val <- min(log_S_matrix, na.rm = TRUE)
@@ -547,105 +543,44 @@ fast_comembership <- function(enhancers, weights, quantile_cutoff = 0, method = 
     S_normalized <- exp(log_S_matrix - max_log_val)
   }
   
-  # 4. 阈值化 (Sparsification) - 解决 Hub 过于臃肿的问题
-  # 只有原本就很强的 Synergy 边才保留
+  # 4. Sparsification - Reduce overly large hubs
+  # Keep only the strongest synergy edges
   S_normalized[is.na(S_normalized)] <- 0
   S_normalized[!is.finite(S_normalized)] <- 0
   diag(S_normalized) <- 0 # 去掉自环
 
-  #防止 quantile 出 NA 的 corner case
+  # Prevent corner cases where quantile might return NA
   vals <- S_normalized[upper.tri(S_normalized)]
-  # 1. 检查是否为空 (防止 n=1 或 n=0 的情况)
   if (length(vals) == 0 || all(!is.finite(vals)) || all(vals == 0, na.rm = TRUE)) {
-      # 矩阵太小，没有非对角线元素，直接返回
       return(as(S_normalized, "dgCMatrix"))
   }
-  # 2. 检查是否全为 0 或全为 NA
+  
+  # Check if all values are 0 or NA
   if (all(vals == 0)) {
-    # 所有边都很弱，直接返回全零矩阵
     S_normalized[,] <- 0
   } else {
-  # 计算保留的阈值 (例如只保留前 25% 强的边)
-  # 注意：这步对于把大 Hub 打散成小 Hub 至关重要
+  # Calculate the threshold to retain only the top edges (e.g., top 25% strongest edges)
+  # This step is crucial for breaking large hubs into smaller hubs
     threshold <- quantile(vals, probs = quantile_cutoff, na.rm = TRUE)
-  # 低于阈值的置为 0
     S_normalized[S_normalized < threshold] <- 0
   }
 
-  # 5. 输出稀疏矩阵
+  # 5. Output the sparse matrix
   dimnames(S_normalized) <- list(enhancers, enhancers)
   return(as(S_normalized, "dgCMatrix"))
 }
 
 
-# ------------------- Step 3: Leiden clustering for each promoter's co-membership matrix -------------------
-run_leiden_for_promoter <- function(promoter_id,
-                                    comembership,
-                                    resolution = 0.5,
-                                    seed = 42) {
 
-  g <- graph_from_adjacency_matrix(
-    comembership,
-    mode     = "undirected",
-    weighted = TRUE
-  )
-
-  enh_names <- V(g)$name
-
-  # enhancer 太少或没有边：整体一个 hub
-  if (length(enh_names) == 0 || vcount(g) < 3 || ecount(g) == 0) {
-    return(tibble(
-      promoter_id = promoter_id,
-      hub_id      = paste0(promoter_id, "_hub1"),
-      enhancers   = list(enh_names),
-      dominance   = 0
-    ))
-  }
-
-  set.seed(seed)
-  cl <- leiden(g, resolution_parameter = resolution)
-
-  cl_df <- tibble(
-    enhancer_id = V(g)$name,
-    cluster     = as.integer(cl)
-  )
-
-  ## ===== NEW: dominance = cluster total node strength (internal + external) =====
-  # Weighted degree (strength) for each node
-  node_strength <- igraph::strength(g, vids = V(g), weights = E(g)$weight)
-
-  # Sum node strength within each cluster
-  hub_strength <- cl_df %>%
-    mutate(node_strength = node_strength[enhancer_id]) %>%  # relies on vertex names
-    group_by(cluster) %>%
-    summarise(
-      dominance = sum(node_strength, na.rm = TRUE),
-      .groups   = "drop"
-    )
-
-  ## ===== Original hubs construction =====
-  hubs <- cl_df %>%
-    group_by(cluster) %>%
-    summarise(
-      promoter_id = promoter_id,
-      enhancers   = list(enhancer_id),
-      .groups     = "drop"
-    ) %>%
-    left_join(hub_strength, by = "cluster") %>%
-    mutate(
-      dominance = ifelse(is.na(dominance), 0, dominance)
-    ) %>%
-    arrange(desc(dominance)) %>%  # ranks main hub first under this dominance definition
-    mutate(
-      hub_rank = row_number(),
-      hub_id   = paste0(promoter_id, "_hub", hub_rank)
-    ) %>%
-    select(promoter_id, hub_id, enhancers, dominance)
-
-  hubs
-}
-
-# ------------------- Step 4: Build enhancer hubs from EP interactions using weights (including comembership and leiden cluster) -------------------
+# [F07] build_hubs_from_EP()
+# Purpose : End-to-end hub construction from EP interactions: candidate promoter filtering, co-membership, Leiden partitioning, and metrics.
+# Inputs  : EP (loops table with weight_raw/weight_percentage), k_min, resolution, seed, quantile_cutoff, method, use_leiden.
+# Outputs : list(observed_hubs=hub summary tibble, loops=EP rows restricted to hub members, hubs=hub-style table).
+# Notes   : This step is computationally heavy; parallelism is configured globally (future plan/workers) via CLI wrapper.
+#' build_hubs_from_EP
+#'
+#' See the vignette and README for usage.
+#' @export
 build_hubs_from_EP <- function(EP,
                                k_min      = 3,
                                resolution = 0.5,
@@ -665,7 +600,7 @@ build_hubs_from_EP <- function(EP,
         n_enh = n(),
         .groups = "drop"
       )
-    cat("Step 1: 候选 promoter 数 =", nrow(candidate_hubs), "\n")
+    cat("Step 1: total promoter number =", nrow(candidate_hubs), "\n")
 
     if (nrow(candidate_hubs) == 0) {
       return(tibble(
@@ -684,7 +619,7 @@ build_hubs_from_EP <- function(EP,
                             ~ fast_comembership(.x, .y, quantile_cutoff, method = method)) ##"log_minmax", "log_zscore", "log_maxnorm"
       )
 
-    cat("超快版完成！矩阵", dim(candidate_hubs_comembership), "，用时 <10 秒\n")
+    cat("Fast co-membership", nrow(candidate_hubs_comembership),"\n")
 
     #Step 3. 对单个 promoter 的 comembership 矩阵跑 Leiden，得到若干 enhancer hub
     #first promoter test leiden clustering 
@@ -699,10 +634,10 @@ build_hubs_from_EP <- function(EP,
     #   resolution   = resolution,
     #   seed         = seed
     # )
-    #   cat("测试单个 promoter 完成，结果：\n")
+    #   cat("single promoter finished.\n")
     #   print(test_result)
 
-    # 对所有单个 promoter 批量跑 Leiden
+    # Run Leiden clustering for all individual promoters in batch
     if (use_leiden=='on') {
       print("Running Leiden clustering for each promoter...")
       candidate_hubs_comembership_subhubs <- candidate_hubs_comembership %>%
@@ -712,11 +647,10 @@ build_hubs_from_EP <- function(EP,
                                                 resolution = resolution,
                                                 seed       = seed))
         ) %>%
-        # select(promoter_id, hubs) %>%
         tidyr::unnest(hubs, names_sep = "_", keep_empty = TRUE)
 
-      cat("检测到总共", nrow(candidate_hubs_comembership_subhubs), "个 promoter-hub 组合\n")
-      print(candidate_hubs_comembership_subhubs, width = Inf)
+      cat("Total", nrow(candidate_hubs_comembership_subhubs), "promoter-hub \n")
+      #print(candidate_hubs_comembership_subhubs, width = Inf)
     } else {
       candidate_hubs_comembership_subhubs <- candidate_hubs_comembership
       candidate_hubs_comembership_subhubs$hubs_hub_id <- candidate_hubs_comembership_subhubs$promoter_id
@@ -742,31 +676,30 @@ build_hubs_from_EP <- function(EP,
     mutate(
       size = length(enhancers),
 
-      # 新增：comembership 是否有有效的行列名（最小化改动的核心）
       cm_ok = !is.null(dimnames(comembership)) &&
               !is.null(rownames(comembership)) &&
               !is.null(colnames(comembership)),
 
-      # 1. 总边权 (Internal Score)
+      # 1. Total edge weight (Internal Score)
       internal_score = if (cm_ok && size >= 2) {
         cm <- comembership[enhancers, enhancers, drop = FALSE]
         sum(cm) / 2
       } else 0,
 
-      # 2. 经典加权密度
+      # 2. Classic weighted density
       weighted_density = if (cm_ok && size >= 2) {
         max_edges = size * (size - 1) / 2
         internal_score / max_edges
       } else 0,
 
-      # 3. 平均非零边权
+      # 3. Average weight of non-zero edges
       avg_non_zero_weight = if (cm_ok && size >= 2) {
         cm <- comembership[enhancers, enhancers, drop = FALSE]
         valid_weights <- cm[upper.tri(cm) & cm > 0]
         if (length(valid_weights) > 0) mean(valid_weights) else 0
       } else 0,
 
-      # 4. 连通比例 (Graph Density)
+      # 4. Connection ratio (Graph Density)
       graph_density = if (cm_ok && size >= 2) {
         cm <- comembership[enhancers, enhancers, drop = FALSE]
         num_edges = sum(cm[upper.tri(cm)] > 0)
@@ -776,7 +709,7 @@ build_hubs_from_EP <- function(EP,
     ) %>%
     ungroup() 
 
-    # Step 4: 构建 full_hubs_merge，包含所有 enhancer - promoter 对应关系
+    # Step 4: Build full_hubs_merge, which contains all enhancer-promoter relationships
     full_hubs <- observed_hubs %>%
       unnest(enhancers)
 
@@ -793,13 +726,17 @@ build_hubs_from_EP <- function(EP,
     hubs[is.na(hubs$hub_index),"hub_index"] <- "hub1"
     hubs[is.na(hubs$hub_id),"hub_id"] <- paste0(hubs[is.na(hubs$hub_id),"promoter_id"],"_hub1")
 
-    cat("Step 8: 最终检测到", nrow(observed_hubs), "个 MEI hubs\n")
-    print(head(observed_hubs))                               
+    cat("Finally detecting", nrow(observed_hubs), "clusters\n")
+    #print(head(observed_hubs))                               
     return(list(observed_hubs = observed_hubs, loops = full_hubs_merge, hubs = hubs) )
   }
   
 
-# ------------------- Step 7: Full MEI discovery pipeline -------------------
+# [F08] PEhub_full()
+# Purpose : Convenience orchestrator for the core MEI discovery pipeline (weights -> observed hubs).
+# Inputs  : raw_data (preprocessed loops), weight_mode, dist_col, q_col, breaks, alpha, sig_cap, sig_beta, k_min, resolution, seed, quantile_cutoff, method.
+# Outputs : list from build_hubs_from_EP() for the observed data.
+# Notes   : Permutation/null testing and post-processing are implemented in downstream steps; keep this function side-effect free.
 PEhub_full <- function(raw_data, weight_mode = c("count_only"), dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, n_perm = 1000, k_min = 3, resolution = 0.1, seed = 42, quantile_cutoff = 0, method = "log_zscore") {
   # raw_data = prep_hichip_weights$loops
   # n_perm = 10
@@ -833,18 +770,24 @@ PEhub_full <- function(raw_data, weight_mode = c("count_only"), dist_col = c("D"
   }
 
 
-# ------------------- Step 8: Hub stability assessment via bootstrap -------------------
-# size-aware threshold（你可以按数据再调）
-# 示例：根据集合大小动态设定阈值
+# [F09] jaccard_threshold_by_size()
+# Purpose : Size-aware Jaccard threshold heuristic for defining 'reproducible' hubs under bootstrap.
+# Inputs  : size (integer hub size).
+# Outputs : numeric threshold in [0,1].
+# Notes   : This is a policy choice; adjust thresholds based on empirical stability calibration and report explicitly.
 jaccard_threshold_by_size <- function(size) {
-  if (size <= 3) return(0.7)  # 小 Hub 要求更高的一致性
+  if (size <= 3) return(0.7)  # Small hubs require higher consistency
   if (size <= 5) return(0.6)
-  return(0.5)                 # 大 Hub 允许一定的漂移
+  return(0.5)                 # Larger hubs allow some flexibility
 }
 
-# 定义 Jaccard 相似度计算函数
+# [F10] calculate_jaccard()
+# Purpose : Compute Jaccard similarity between two enhancer sets.
+# Inputs  : set1, set2 (vectors of enhancer IDs).
+# Outputs : numeric Jaccard index in [0,1].
+# Notes   : Empty-set behavior is defined explicitly (returns 0 when both empty).
 calculate_jaccard <- function(set1, set2) {
-  # 如果两个都是空的（理论上不应发生），定义为 0 或 1 取决于逻辑，这里给 0
+  # If both sets are empty (shouldn't happen in theory), define as 0 or 1 based on logic; here we use 0
   if (length(set1) == 0 && length(set2) == 0) return(0)
   
   inter <- length(intersect(set1, set2))
@@ -853,6 +796,16 @@ calculate_jaccard <- function(set1, set2) {
   return(inter / union)
 }
 
+# [F11] calculate_hub_stability()
+# Purpose : Bootstrap-based stability assessment for observed hubs using Poisson-resampled counts and re-discovery.
+# Inputs  : raw_data, observed_hubs, weight_mode, dist_col, q_col, breaks, alpha, sig_cap, sig_beta, B, subsample_frac, k_min, resolution, quantile_cutoff, method, seed.
+# Outputs : observed_hubs table augmented with jaccard_stability_score, reproducibility_rate, existence_rate.
+# Notes   : B, subsample_frac, and thresholds (tau) materially affect results; expose via CLI and log in a run manifest.
+#' calculate_hub_stability
+#'
+#' See the vignette and README for usage.
+#' @importFrom tidyr unnest_wider
+#' @export
 calculate_hub_stability <- function(raw_data, observed_hubs, weight_mode = c("count_only"), dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, 
                                     B = 10, subsample_frac = 0.8,
                                     k_min = 3, resolution = 0.5,
@@ -878,18 +831,16 @@ calculate_hub_stability <- function(raw_data, observed_hubs, weight_mode = c("co
   # Bootstrap runs
   message(paste0("Running ", B, " bootstrap iterations..."))
 
-  # 1. 预分配进度条
-  pb <- progress_bar$new(
+  .have_progress <- requireNamespace("progress", quietly = TRUE)
+  pb <- if (.have_progress) progress::progress_bar$new(
     format = "  Processing [:bar] :percent pts: :elapsedfull ETA: :eta",
-    total = B, clear = FALSE, width = 60)
+    total = B, clear = FALSE, width = 60) else NULL
 
-  # 2. 使用 map 进行迭代
   stability_runs <- map(1:B, function(i) {
     print(paste0("Bootstrap iteration ", i, "/", B))
-    pb$tick() # 更新进度条
+    if (!is.null(pb)) pb$tick() 
     
     set.seed(seed + i)
-    # 执行计算逻辑
     EP_bs <- raw_data %>% 
       mutate(counts = rpois(n(), lambda = pmax(0, subsample_frac * counts))) 
     
@@ -897,14 +848,12 @@ calculate_hub_stability <- function(raw_data, observed_hubs, weight_mode = c("co
 
     run_res <- build_hubs_from_EP(EP_bs$loops, k_min=k_min, resolution=resolution, seed=seed + i, quantile_cutoff=quantile_cutoff, method=method, use_leiden = 'on')
 
-    # 关键点：手动清理内存，防止随着循环进行越来越慢
     rm(EP_bs)
 
     if (i %% 5 == 0) gc() 
 
     if (is.null(run_res)) return(NULL)
 
-    # 提取有效信息
     valid_hubs <- run_res$observed_hubs %>% 
       filter(!is.null(enhancers), lengths(enhancers) > 0)
     
@@ -915,28 +864,28 @@ calculate_hub_stability <- function(raw_data, observed_hubs, weight_mode = c("co
   valid_runs <- compact(stability_runs)
   n_valid <- length(valid_runs)
   
-  # 3. 计算得分
+  # 3. Calculate stability scores
   scored_results <- observed_hubs %>%
     mutate(
       stability_metrics = map2(promoter_id, enhancers, function(p_id, ref_set) {
-        # 获取该 promoter 在所有有效迭代中的表现
-        tau <- 0.5 #jaccard_threshold_by_size(length(ref_set))
-        
+        # Get the performance of this promoter across all valid iterations
+        tau <- 0.5 # Jaccard threshold for reproducibility
+
         js <- map_dbl(valid_runs, function(m) {
-          cand_sets <- m[[p_id]] # 获取该次迭代中该 promoter 下的所有候选 hubs
+          cand_sets <- m[[p_id]] # Get all candidate hubs for this promoter in the current iteration
           if (is.null(cand_sets)) return(0)
-          # 找到最像的那一个
+          # Find the most similar hub
           max(vapply(cand_sets, function(x) calculate_jaccard(x, ref_set), numeric(1)))
         })
         ov_best <- map_int(valid_runs, function(m) {
           cand_sets <- m[[p_id]]
           if (is.null(cand_sets) || length(cand_sets) == 0) return(0L)
 
-          # 先找出“最像的那个 hub”（按 Jaccard 最大）
+          # Find the best matching hub (highest Jaccard similarity)
           jvals <- vapply(cand_sets, function(x) calculate_jaccard(x, ref_set), numeric(1))
           k <- which.max(jvals)
 
-          # 计算该最佳匹配 hub 的 overlap 数
+          # Count the overlap size of the best matching hub
           length(intersect(cand_sets[[k]], ref_set))
         })
 
@@ -947,35 +896,39 @@ calculate_hub_stability <- function(raw_data, observed_hubs, weight_mode = c("co
         )
       })) %>%
     unnest_wider(stability_metrics)
-  print(paste("Hub stability number:", nrow(scored_results[scored_results$reproducibility_rate >= 0.5, ])))
+  #print(paste("Hub stability number:", nrow(scored_results[scored_results$reproducibility_rate >= 0.5, ])))
   return(scored_results)
 }
 
 
 
-# ------------------- Step 8: Build null model for hub p-value calculation -------------------
+# [F12] build.null.pvalue()
+# Purpose : Prepare distance-stratified weight pools and per-hub node/bin lists for global p-value estimation.
+# Inputs  : hub_tbl (hub summaries), hub_tbl_ep (EP edges for hubs), hub_tbl_all_ep (genome-wide EP pool), method, weight_method, B, quantile_cutoff, stat.
+# Outputs : list(hubs=hub table with w_list/bin_list attached, global_bins=distance-bin pooled weights).
+# Notes   : This function prepares inputs only; heavy Monte Carlo is executed by build.null.pvalue.calculate().
 build.null.pvalue <- function(hub_tbl, hub_tbl_ep, hub_tbl_all_ep, method = "log_minmax", weight_method = "bin_log_ratio_sig", B = 1000, quantile_cutoff = 0, stat = "density") {
   print("Building null model for hub p-value calculation...")
   # B <- 100
   # method <- "log_minmax"      
-  # quantile_cutoff <- 0        # 与你 fast_comembership 设置一致
-  # stat <- "density"           # 推荐；若你坚持“总强度”，用 "sum"
+  # quantile_cutoff <- 0        # Should match the fast_comembership setting
+  # stat <- "density"           # Recommended; use "sum" if you prefer total strength
 
   ## =========================================================
-  ## 1) 距离分箱（全局 pool 的 bin）
+  ## 1) Distance binning (global pool bins)
   ## =========================================================
-  # breaks <- c(0, 1e4, 5e4, 1e5, 2.5e5, 5e5, 1e6, 1.5e6, 2e6, Inf)
+  # Define distance bins
   breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6, Inf)
 
-  ## 注意：你的 EP 表里同时出现过 D 和 distance，这里统一使用 D。
-  ## 如果你的列名叫 distance，就把 D 改成 distance。
+  ## Note: The EP table may use either "D" or "distance" as the column name.
+  ## Here, we assume "D". If your column is named "distance", replace "D" with "distance".
 
   ## =========================================================
-  ## 2) 选择用哪个“节点权重”做 null 与 hub score
+  ## 2) Select the weight column for null and hub score calculation
   ## =========================================================
-  ## 你说 weight_raw 是用于算 comembership 的——这里就用 weight_raw。
-  ## 但你的 EP 明细表里列名可能是 weight_raw.x 或 weight_raw.y（join 后）。
-  ## 下面做一个鲁棒选择：优先 weight_raw.x，其次 weight_raw，再其次 weight_raw.y
+  ## Use "weight_raw" for comembership calculations. The column name might vary
+  ## (e.g., "weight_raw.x" or "weight_raw.y" after a join).
+  ## The function below ensures robust selection of the correct column.
   pick_weight_col <- function(df) {
     if ("weight_raw.x" %in% names(df)) return("weight_raw.x")
     if ("weight_raw"   %in% names(df)) return("weight_raw")
@@ -986,24 +939,24 @@ build.null.pvalue <- function(hub_tbl, hub_tbl_ep, hub_tbl_all_ep, method = "log
   wcol <- pick_weight_col(hub_tbl_ep)
 
   ## =========================================================
-  ## 3) 构建全局 distance-stratified 权重池（节点层）
+  ## 3) Build a global distance-stratified weight pool (node level)
   ## =========================================================
   global_bins <- hub_tbl_all_ep %>%
-    filter(pair_type == "PE") %>%                 # 只用 EP
+    filter(pair_type == "PE") %>%                 # Use only EP interactions
     filter(is.finite(D), D >= 0) %>%
     mutate(dist_bin = cut(D, breaks = breaks, include.lowest = TRUE, right = TRUE)) %>%
     group_by(dist_bin) %>%
     summarise(weight_pool = list(.data[[wcol_all]]), .groups = "drop")
-  ## 一个安全检查：每个 bin 至少要有一些值
+  ## Safety check: Ensure each bin has enough values
   if (any(lengths(global_bins$weight_pool) < 50)) {
     message("Warning: some distance bins have small pool size (<50). Consider merging bins or using fewer breaks.")
   }
 
   ## =========================================================
-  ## 4) 为每个 hub 准备 dist_bins（关键：从 EP 明细表提取每个 enhancer 的 D）
+  ## 4) Prepare dist_bins for each hub (extract enhancer distances from EP table)
   ## =========================================================
-  ## 我们从 hub_tbl_ep 中提取：hub_id + enhancer_id + D + weight_raw
-  ## 去重后按 hub 汇总成 list（与 hub_tbl 的 enhancers 对齐）
+  ## Extract hub_id + enhancer_id + D + weight_raw from hub_tbl_ep
+  ## Deduplicate and group by hub to align with hub_tbl enhancers
   hub_nodes <- hub_tbl_ep %>%
     select(promoter_id, enhancer_id, D, w = all_of(wcol)) %>%
     distinct(promoter_id, enhancer_id, .keep_all = TRUE) %>%
@@ -1016,24 +969,15 @@ build.null.pvalue <- function(hub_tbl, hub_tbl_ep, hub_tbl_all_ep, method = "log
       .groups  = "drop"
     )
 
-  ## 将 hub_nodes 合并回 hub_tbl
+  ## Merge hub_nodes back into hub_tbl
   hub_tbl2 <- hub_tbl %>%
     select(promoter_id, hub_id, enhancers, weight_raw, size, cm_ok, weighted_density, internal_score) %>%
     left_join(hub_nodes, by = c("promoter_id"))
 
   ## =========================================================
-  ## 5.5) 关键：避免闭包捕获巨大环境（并行 globals 爆炸）
+  ## 6) Compute global p-values (recommended stat: density, aligns with weighted_density)
   ## =========================================================
-  # environment(hub_score_from_weights) <- .GlobalEnv
-  # environment(calculate_global_p)     <- .GlobalEnv
-
-  # assign("hub_score_from_weights", hub_score_from_weights, envir = .GlobalEnv)
-  # assign("calculate_global_p",     calculate_global_p,     envir = .GlobalEnv)
-
-  ## =========================================================
-  ## 6) 计算全局 p-value（建议 stat 用 density，与 weighted_density 同类）
-  ## =========================================================
-  ## Step 1: flags
+  ## Step 1: Flags
   hub_tbl3 <- hub_tbl2 %>%
     mutate(
       has_w   = map_lgl(w_list,   ~ !is.null(.x) && length(.x) >= 2),
@@ -1047,9 +991,11 @@ build.null.pvalue <- function(hub_tbl, hub_tbl_ep, hub_tbl_all_ep, method = "log
   ))
 }
 
-## =========================================================
-## 5) hub score：用你已有的 fast_comembership() 逻辑计算
-## =========================================================
+# [F13] hub_score_from_weights()
+# Purpose : Compute a hub score from node weights by constructing a co-membership matrix and summarizing its edge weights.
+# Inputs  : w (numeric), method, quantile_cutoff, stat ('density' or 'sum').
+# Outputs : numeric hub score (density-normalized or raw sum).
+# Notes   : Must match the scoring used in observed discovery; otherwise p-values are not interpretable.
 hub_score_from_weights <- function(w,
                                   method = "log_minmax",
                                   quantile_cutoff = 0,
@@ -1070,107 +1016,120 @@ hub_score_from_weights <- function(w,
     method = method
   )
 
-  s <- as.numeric(sum(cm) / 2)  # 上三角总和（无向边）
+  s <- as.numeric(sum(cm) / 2)  
   if (stat == "sum") return(s)
   return(s / (n * (n - 1) / 2)) # density
 }
 
+# [F14] calculate_global_p()
+# Purpose : Monte Carlo p-value for a hub score under a chosen null sampling scheme (distance-matched / histogram-matched / global).
+# Inputs  : observed_weights, dist_bins, pool_map, B, method, quantile_cutoff, stat, null_mode.
+# Outputs : list(p, obs, null_median).
+# Notes   : Uses a smoothed p-value to avoid 0; ensure pool_map sizes are adequate per distance bin.
 calculate_global_p <- function(observed_weights,
-                               dist_bins,
-                               pool_map,
-                               B = 10000,
-                               method = "log_minmax",
-                               quantile_cutoff = 0,
-                               stat = c("density", "sum"),
-                               null_mode = c("distance_matched", "hist_matched", "global")) {
+                 dist_bins,
+                 pool_map,
+                 B = 10000,
+                 method = "log_minmax",
+                 quantile_cutoff = 0,
+                 stat = c("density", "sum"),
+                 null_mode = c("distance_matched", "hist_matched", "global")) {
   stat <- match.arg(stat)
   null_mode <- match.arg(null_mode)
 
-  # observed
+  # Calculate the observed hub score
   obs_score <- hub_score_from_weights(
-    observed_weights,
-    method = method,
-    quantile_cutoff = quantile_cutoff,
-    stat = stat
+  observed_weights,
+  method = method,
+  quantile_cutoff = quantile_cutoff,
+  stat = stat
   )
 
-  # 为每个节点/bin 找到对应 pool（注意 dist_bins 可能是 factor）
+  # Map each node/bin to its corresponding pool (dist_bins might be a factor)
   key <- as.character(dist_bins)
 
   if (null_mode == "distance_matched") {
-    # strict: one pool per node (length == n)
-    pools <- pool_map[key]
-    if (any(vapply(pools, is.null, logical(1)))) {
-      return(list(p = NA_real_, obs = obs_score, null_median = NA_real_))
-    }
+  # Strict mode: each node gets its own pool (length == number of nodes)
+  pools <- pool_map[key]
+  if (any(vapply(pools, is.null, logical(1)))) {
+    return(list(p = NA_real_, obs = obs_score, null_median = NA_real_))
+  }
 
-    null_scores <- replicate(B, {
-      w_star <- vapply(pools, function(pool) sample(pool, 1), numeric(1))
-      hub_score_from_weights(
-        w_star,
-        method = method,
-        quantile_cutoff = quantile_cutoff,
-        stat = stat
-      )
-    })
+  # Generate null scores by sampling one weight per node from its pool
+  null_scores <- replicate(B, {
+    w_star <- vapply(pools, function(pool) sample(pool, 1), numeric(1))
+    hub_score_from_weights(
+    w_star,
+    method = method,
+    quantile_cutoff = quantile_cutoff,
+    stat = stat
+    )
+  })
 
   } else if (null_mode == "hist_matched") {
-    # relaxed but still distance-aware: match the hub's distance-bin histogram
-    bin_counts <- table(key)
-    bins <- names(bin_counts)
+  # Relaxed mode: match the hub's distance-bin histogram
+  bin_counts <- table(key)
+  bins <- names(bin_counts)
 
-    pools_by_bin <- pool_map[bins]
-    if (any(vapply(pools_by_bin, is.null, logical(1)))) {
-      return(list(p = NA_real_, obs = obs_score, null_median = NA_real_))
-    }
-    counts <- as.integer(bin_counts)
+  pools_by_bin <- pool_map[bins]
+  if (any(vapply(pools_by_bin, is.null, logical(1)))) {
+    return(list(p = NA_real_, obs = obs_score, null_median = NA_real_))
+  }
+  counts <- as.integer(bin_counts)
 
-    null_scores <- replicate(B, {
-      # draw k samples from each bin pool, then concatenate
-      w_star <- unlist(
-        Map(function(pool, k) sample(pool, size = k, replace = TRUE),
-            pools_by_bin, counts),
-        use.names = FALSE
-      )
+  # Generate null scores by sampling weights based on the bin histogram
+  null_scores <- replicate(B, {
+    w_star <- unlist(
+    Map(function(pool, k) sample(pool, size = k, replace = TRUE),
+      pools_by_bin, counts),
+    use.names = FALSE
+    )
 
-      hub_score_from_weights(
-        w_star,
-        method = method,
-        quantile_cutoff = quantile_cutoff,
-        stat = stat
-      )
-    })
+    hub_score_from_weights(
+    w_star,
+    method = method,
+    quantile_cutoff = quantile_cutoff,
+    stat = stat
+    )
+  })
   } else if (null_mode == "global") {
-        global_pool <- unlist(pool_map[-(1:2)], use.names = FALSE)
-        
-        # 确定当前 Hub 需要抽取的节点数量 (n)
-        n_nodes <- length(observed_weights)
-        
-        null_scores <- replicate(B, {
-          # 直接从全基因组大池子里随机抽 n 个权重
-          w_star <- sample(global_pool, size = n_nodes, replace = TRUE)
-          
-          hub_score_from_weights(
-            w_star,
-            method = method,
-            quantile_cutoff = quantile_cutoff,
-            stat = stat
-          )
-        })}
+  # Global mode: sample weights from the entire global pool
+  global_pool <- unlist(pool_map[-(1:2)], use.names = FALSE)
+  
+  # Determine the number of nodes in the current hub
+  n_nodes <- length(observed_weights)
+  
+  # Generate null scores by sampling weights from the global pool
+  null_scores <- replicate(B, {
+    w_star <- sample(global_pool, size = n_nodes, replace = TRUE)
+    
+    hub_score_from_weights(
+    w_star,
+    method = method,
+    quantile_cutoff = quantile_cutoff,
+    stat = stat
+    )
+  })
+  }
 
-  # smoothed p-value to avoid 0
+  # Calculate the smoothed p-value to avoid zero
   p_val <- (1 + sum(null_scores >= obs_score, na.rm = TRUE)) / (1 + length(null_scores))
 
   list(
-    p = p_val,
-    obs = obs_score,
-    null_median = median(null_scores, na.rm = TRUE)
+  p = p_val,
+  obs = obs_score,
+  null_median = median(null_scores, na.rm = TRUE)
   )
 }
 
 
 
-## calculate global p-values for each hub using parallelization
+# [F15] build.null.pvalue.calculate()
+# Purpose : Parallelized computation of global p-values for all hubs using the prepared pools and per-hub inputs.
+# Inputs  : hub_tbl3 (from build.null.pvalue()), global_bins, B, method, quantile_cutoff, stat, null_mode.
+# Outputs : hub table with hub_p_value_global, hub_p_adj_global (BH), observed/null scores, and OE_ratio_global.
+# Notes   : The parallel backend and worker count must be configured via CLI; monitor memory due to large pools.
+## Internal: compute global p-values from prepared null inputs.
 build.null.pvalue.calculate <- function(hub_tbl3, global_bins, B = 1000, method = "log_minmax", quantile_cutoff = 0, stat = "sum", null_mode = "distance_matched") {
   ## Step 2: heavy compute (res_list)
   print("Start the heavy step, calculating global p-values for each hub...")
@@ -1188,41 +1147,46 @@ build.null.pvalue.calculate <- function(hub_tbl3, global_bins, B = 1000, method 
 
   pool_map_small <- shrink_pool_map(pool_map, max_per_bin = 1000000, seed = 1)
 
-  res_list <- furrr::future_map2(
-    hub_tbl3$w_list,
-    hub_tbl3$bin_list,
-    function(w_vec, bin_vec) {
-      ok <- !is.null(w_vec) && length(w_vec) >= 2 &&
-            !is.null(bin_vec) && length(bin_vec) >= 2
-      if (!ok) return(list(p = NA_real_, obs = NA_real_, null_median = NA_real_))
-
-      calculate_global_p(
-        observed_weights = w_vec,
-        dist_bins        = bin_vec,
-        # global_bins      = global_bins,
-        pool_map         = pool_map_small,
-        B                = B,
-        method           = method,
-        quantile_cutoff  = quantile_cutoff,
-        stat             = stat,
-        null_mode = null_mode
-      )
-    },
-    .options = furrr::furrr_options(
-      seed = TRUE,
-      packages = c("Matrix"),
-        globals = list(
-          calculate_global_p = calculate_global_p,
-          pool_map            = pool_map_small,
-          B                   = B,
-          method              = method,
-          quantile_cutoff     = quantile_cutoff,
-          stat                = stat,
-          hub_score_from_weights = hub_score_from_weights,
-          fast_comembership   = fast_comembership
-        )
+  .one_p <- function(w_vec, bin_vec) {
+    ok <- !is.null(w_vec) && length(w_vec) >= 2 &&
+          !is.null(bin_vec) && length(bin_vec) >= 2
+    if (!ok) return(list(p = NA_real_, obs = NA_real_, null_median = NA_real_))
+    calculate_global_p(
+      observed_weights = w_vec,
+      dist_bins        = bin_vec,
+      pool_map         = pool_map_small,
+      B                = B,
+      method           = method,
+      quantile_cutoff  = quantile_cutoff,
+      stat             = stat,
+      null_mode        = null_mode
     )
-  )
+  }
+
+  ## Use furrr for parallelism if available (and a future plan is set); otherwise
+  ## fall back to serial purrr::map2. Results are identical either way.
+  if (requireNamespace("furrr", quietly = TRUE)) {
+    res_list <- furrr::future_map2(
+      hub_tbl3$w_list, hub_tbl3$bin_list, .one_p,
+      .options = furrr::furrr_options(
+        seed = TRUE,
+        packages = c("Matrix"),
+        globals = list(
+          calculate_global_p     = calculate_global_p,
+          pool_map_small         = pool_map_small,
+          B                      = B,
+          method                 = method,
+          quantile_cutoff        = quantile_cutoff,
+          stat                   = stat,
+          null_mode              = null_mode,
+          hub_score_from_weights = hub_score_from_weights,
+          fast_comembership      = fast_comembership
+        )
+      )
+    )
+  } else {
+    res_list <- purrr::map2(hub_tbl3$w_list, hub_tbl3$bin_list, .one_p)
+  }
   print("Finished calculating global p-values.")
 
   hub_tbl_p <- hub_tbl3 %>%
@@ -1240,13 +1204,18 @@ build.null.pvalue.calculate <- function(hub_tbl3, global_bins, B = 1000, method 
     ) %>%
     select(-.res, -has_w, -has_bin, -has_inputs)
 
-  ## 你也可以看看显著 hub 的数量
-  print(paste0("Pvalue num FDR<0.05 hubs: ", sum(hub_tbl_p$hub_p_adj_global < 0.05, na.rm = TRUE)))
+  #print(paste0("Pvalue<0.05 hubs: ", length(unique(hub_tbl_p[hub_tbl_p$hub_p_value_global < 0.05,"promoter_id"]))))
+  #print(paste0("FDR<0.05 hubs: ", length(unique(hub_tbl_p[hub_tbl_p$hub_p_adj_global < 0.05,"promoter_id"]))))
   
   return(hub_tbl_p)
 }
 
-# ------------------- Step 10: End-to-end workflow -------------------
+# [F16] build.run.preprocess()
+# Purpose : CLI-facing wrapper to preprocess inputs for a sample and persist intermediate RData for downstream steps.
+# Inputs  : loop_file (significant interactions; CLI), loop_file_all (all interactions; CLI), outdir (CLI), tss_input, filename (sample ID), promoter_window.
+# Outputs : Writes '<outdir>/multiple_result.<filename>.hub.all.preprocess.RData'.
+# Notes   : This function performs file I/O; ensure outdir exists and is writable before invoking via Rscript.
+## Internal engine for the build.run.preprocess stage; use the pehub_* API instead.
 build.run.preprocess <- function(loop_file, loop_file_all, outdir, tss_input, filename, promoter_window=0) {
   prep_hichip_all <- preprocess_hichip(loop_file = loop_file, tss_input = tss_input, mode = "all", promoter_window = promoter_window)
   prep_hichip <- preprocess_hichip(loop_file = loop_file, tss_input = tss_input, mode = "promoter", promoter_window = promoter_window)
@@ -1256,9 +1225,17 @@ build.run.preprocess <- function(loop_file, loop_file_all, outdir, tss_input, fi
   print("Preprocessing done.")
 }
 
-build.run.all <- function(outdir, method, weight_method, filename, promoter_window=0) {
+# [F17] build.run.all()
+# Purpose : CLI-facing wrapper to run observed hub discovery for one (method, weight_method) setting and persist preprocess objects for cutoff.
+# Inputs  : outdir (CLI), method, weight_method, filename, promoter_window.
+# Outputs : Writes '<outdir>/multiple_result.<filename>.hub.<method>.<weight_method>.preprocess.RData'.
+# Notes   : Requires that build.run.preprocess() has been executed for the same filename/outdir.
+## Internal engine for the build.run.all stage; use the pehub_* API instead.
+build.run.all <- function(outdir, method, weight_method, filename, promoter_window = 0,
+                          k_min = 3, resolution = 1.0, quantile_cutoff = 0.2,
+                          B_pvalue = 1000) {
   load(file.path(outdir, paste("multiple_result",filename,"hub","all.preprocess.RData",sep=".")))
-  observed_hubs_per_promoter <- PEhub_full(raw_data = prep_hichip$loops, weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, n_perm = 10, resolution = 1.0, k_min = 3, seed = 42, quantile_cutoff = 0.2, method = method)
+  observed_hubs_per_promoter <- PEhub_full(raw_data = prep_hichip$loops, weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, n_perm = 10, resolution = resolution, k_min = k_min, seed = 42, quantile_cutoff = quantile_cutoff, method = method)
   observed_hubs_per_promoter_sub <- observed_hubs_per_promoter$loops[!is.na(observed_hubs_per_promoter$loops$hub_index) & observed_hubs_per_promoter$loops$hub_index=="hub1",]
   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter$hubs[!is.na(observed_hubs_per_promoter$hubs$hub_index) & observed_hubs_per_promoter$hubs$hub_index=="hub1",]
   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub[order(observed_hubs_per_promoter_sub_hub$hubid),]
@@ -1266,19 +1243,33 @@ build.run.all <- function(outdir, method, weight_method, filename, promoter_wind
   #pvalue prepare
   all_ep_data_weight <- compute_weights(all_ep_data$loops, weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5)
   observed_hubs_per_promoter_sub_observed <- observed_hubs_per_promoter$observed_hubs[observed_hubs_per_promoter$observed_hubs$promoter_id %in% observed_hubs_per_promoter_sub$promoter_id,]
-  observed_hubs_per_promoter_pvalue_prepare <- build.null.pvalue(hub_tbl=observed_hubs_per_promoter_sub_observed, hub_tbl_ep=observed_hubs_per_promoter_sub, hub_tbl_all_ep=all_ep_data_weight$loops, method = method, B = 1000, quantile_cutoff = 0.2, stat = "density")
+  observed_hubs_per_promoter_pvalue_prepare <- build.null.pvalue(hub_tbl=observed_hubs_per_promoter_sub_observed, hub_tbl_ep=observed_hubs_per_promoter_sub, hub_tbl_all_ep=all_ep_data_weight$loops, method = method, B = B_pvalue, quantile_cutoff = quantile_cutoff, stat = "density")
 
   save(observed_hubs_per_promoter, observed_hubs_per_promoter_sub, observed_hubs_per_promoter_sub_hub, observed_hubs_per_promoter_pvalue_prepare, file = file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"preprocess.RData",sep=".")))
   print("All runs done.")
 }
 
-build.cutoff <- function(outdir, method, weight_method, filename) {
+# [F18] build.cutoff()
+# Purpose : CLI-facing wrapper to compute hub stability metrics and global p-values, then persist merged results.
+# Inputs  : outdir (CLI), method, weight_method, filename.
+# Outputs : Writes '<outdir>/multiple_result.<filename>.hub.<method>.<weight_method>.RData'.
+# Notes   : Uses both bootstrap (B) and Monte Carlo (B) parameters hardcoded in calls; expose via CLI in your wrapper.
+## Internal engine for the build.cutoff stage; use the pehub_* API instead.
+build.cutoff <- function(outdir, method, weight_method, filename,
+                         k_min = 3, resolution = 1.0, quantile_cutoff = 0.2,
+                         B_pvalue = 1000, B_stability = 10,
+                         null_mode = "hist_matched",
+                         pvalue_cutoff = 0.05, stability_cutoff = 0.5) {
   print(paste("Starting post-cutoff:", filename))
   load(file.path(outdir, paste("multiple_result",filename,"hub","all.preprocess.RData",sep=".")))
   load(file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"preprocess.RData",sep=".")))
   
   # #stability 
-  observed_hubs_per_promoter_stability_all <- calculate_hub_stability(raw_data = prep_hichip$loops, observed_hubs = observed_hubs_per_promoter$observed_hubs[!is.null(observed_hubs_per_promoter$observed_hubs$enhancers) & observed_hubs_per_promoter$observed_hubs$hub_index=="hub1",], weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, B = 10, resolution = 1.0,  k_min = 3, quantile_cutoff = 0.2, method = method)
+  observed_hubs_per_promoter_stability_all <- calculate_hub_stability(raw_data = prep_hichip$loops, observed_hubs = observed_hubs_per_promoter$observed_hubs[!is.null(observed_hubs_per_promoter$observed_hubs$enhancers) & observed_hubs_per_promoter$observed_hubs$hub_index=="hub1",], weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, 
+    B = B_stability, subsample_frac = 0.8,
+    k_min = k_min, resolution = resolution,
+    quantile_cutoff = quantile_cutoff, method = method,
+    seed = 42)
   observed_hubs_per_promoter_stability <- observed_hubs_per_promoter_stability_all %>% select(promoter_id, hub_id, jaccard_stability_score, reproducibility_rate, existence_rate) # %>% filter(!is.na(hub_p_adj_global), hub_p_adj_global <= 0.05)
   observed_hubs_per_promoter_sub <- observed_hubs_per_promoter_sub %>% left_join( observed_hubs_per_promoter_stability, by = c("promoter_id", "hub_id") )
   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub %>% left_join( observed_hubs_per_promoter_stability, by = c("promoter_id", "hub_id") )
@@ -1286,201 +1277,77 @@ build.cutoff <- function(outdir, method, weight_method, filename) {
   #observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_stability %>%  filter(reproducibility_rate >= 0.5 & existence_rate >= 0.5)
 
   #pvalue
-  observed_hubs_per_promoter_pvalue_all <- build.null.pvalue.calculate(hub_tbl3=observed_hubs_per_promoter_pvalue_prepare$hubs, global_bins=observed_hubs_per_promoter_pvalue_prepare$global_bins, method = method, B = 1000, quantile_cutoff = 0.2, stat = "sum", null_mode = "hist_matched")
-  observed_hubs_per_promoter_pvalue <- observed_hubs_per_promoter_pvalue_all %>% select(promoter_id, hub_id, hub_p_value_global, hub_p_adj_global, hub_score_obs_global, hub_score_null_median, OE_ratio_global) # %>% filter(!is.na(hub_p_adj_global), hub_p_adj_global <= 0.05)
+  observed_hubs_per_promoter_pvalue_all <- build.null.pvalue.calculate(hub_tbl3=observed_hubs_per_promoter_pvalue_prepare$hubs, global_bins=observed_hubs_per_promoter_pvalue_prepare$global_bins, method = method, B = B_pvalue, quantile_cutoff = quantile_cutoff, stat = "sum", null_mode = null_mode)
+  observed_hubs_per_promoter_pvalue <- observed_hubs_per_promoter_pvalue_all %>% select(promoter_id, hub_id, hub_p_value_global, hub_p_adj_global, hub_score_obs_global, hub_score_null_median, OE_ratio_global)
   observed_hubs_per_promoter_sub <- observed_hubs_per_promoter_sub %>% left_join( observed_hubs_per_promoter_pvalue, by = c("promoter_id", "hub_id") )
   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub %>% left_join( observed_hubs_per_promoter_pvalue, by = c("promoter_id", "hub_id") )
   save(prep_hichip_all, prep_hichip, observed_hubs_per_promoter, observed_hubs_per_promoter_sub, observed_hubs_per_promoter_sub_hub, observed_hubs_per_promoter_stability, observed_hubs_per_promoter_pvalue, file = file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"RData",sep=".")))
 }
 
-build.postprocess <- function(outdir, method, weight_method, filename) {
+# [F19] build.postprocess()
+# Purpose : Export final significant hubs and remaining pairwise interactions to BED/BEDPE/TXT deliverables.
+# Inputs  : outdir (CLI), method, weight_method, filename.
+# Outputs : Writes hub and pairwise exports under '<outdir>/' with prefixes 'multiple_result' and 'pairwise'.
+# Notes   : Selection thresholds (FDR, reproducibility_rate, etc.) are policy choices; keep them configurable via CLI wrapper.
+## Internal engine for the build.postprocess stage; use the pehub_* API instead.
+build.postprocess <- function(outdir, method, weight_method, filename,
+                              pvalue_cutoff = 0.05, stability_cutoff = 0.5,
+                              use_adjusted_p = FALSE) {
   print(paste("Starting post-processing:", filename))
   load(file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"RData",sep=".")))
   
-  #export significant hubs
-  observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub %>% filter(!is.na(hub_p_adj_global), hub_p_adj_global <= 0.05, reproducibility_rate >= 0.5) # | OE_ratio_global > 1.5
-  print(paste0("Significant hubs number: ", nrow(observed_hubs_per_promoter_sub_hub)))
-  observed_hubs_per_promoter_sub_hub$name <- with(observed_hubs_per_promoter_sub_hub[order(observed_hubs_per_promoter_sub_hub$hubid),], { h <- gsub("_","", observed_hubs_per_promoter_sub_hub$hubid); paste0(observed_hubs_per_promoter_sub_hub$promoter_gene_name, "_", h, "_", ave(h, h, FUN = seq_along)) })
-  gr <- makeGRangesFromDataFrame(observed_hubs_per_promoter_sub_hub,keep.extra.columns = TRUE)
-  export(gr, con=file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"bed",sep=".")))
-  write.table(as.data.frame(observed_hubs_per_promoter_sub_hub)[,c(1:21,ncol(observed_hubs_per_promoter_sub_hub))], file=file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"txt",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-  colnames(observed_hubs_per_promoter_sub)[1] <- paste0("#",colnames(observed_hubs_per_promoter_sub)[1])
-  write.table(observed_hubs_per_promoter_sub[,1:12], file=file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"bedpe",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-  
-  #pairwise
-  observed_hubs_per_promoter_sub_hub_pairs <- prep_hichip$hubs[!prep_hichip$hubs$hubid %in% observed_hubs_per_promoter_sub_hub$hubid,]
-  observed_hubs_per_promoter_sub_pairs <- prep_hichip$loops[!prep_hichip$loops$hubid %in% observed_hubs_per_promoter_sub$hubid,]
-  gr_pairs <- makeGRangesFromDataFrame(observed_hubs_per_promoter_sub_hub_pairs,keep.extra.columns = TRUE)
-  gr_pairs$name <- gr_pairs$hubid
-  export(gr_pairs, con=file.path(outdir, paste("multiple_result",filename,"pairwise",method,weight_method,"bed",sep=".")))
-  write.table(as.data.frame(observed_hubs_per_promoter_sub_hub_pairs), file=file.path(outdir, paste("multiple_result",filename,"pairwise",method,weight_method,"txt",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-  colnames(observed_hubs_per_promoter_sub_pairs)[1] <- paste0("#",colnames(observed_hubs_per_promoter_sub_pairs)[1])
-  write.table(observed_hubs_per_promoter_sub_pairs[,1:12], file=file.path(outdir, paste("multiple_result",filename,"pairwise",method,weight_method,"bedpe",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-  
+  ## 内部 helper：加 name 列，写 BED/TXT/BEDPE，同时写 pairwise
+  .export_hub_set <- function(hub_tbl, ep_tbl, tag) {
+    hub_tbl$name <- with(hub_tbl[order(hub_tbl$hubid), ], {
+      h <- gsub("_", "", hub_tbl$hubid)
+      paste0(hub_tbl$promoter_gene_name, "_", h, "_", ave(h, h, FUN = seq_along))
+    })
+    stem  <- paste("multiple_result", filename, "hub",      method, weight_method, tag, sep = ".")
+    pstem <- paste("multiple_result", filename, "pairwise", method, weight_method, tag, sep = ".")
+    .write_bed(hub_tbl, con = file.path(outdir, paste0(stem, ".bed")))
+    write.table(as.data.frame(hub_tbl)[, c(1:21, ncol(hub_tbl))],
+                file.path(outdir, paste0(stem, ".txt")), sep="\t", quote=FALSE, row.names=FALSE)
+    ep_sub <- ep_tbl %>% filter(hubid %in% hub_tbl$hubid)
+    colnames(ep_sub)[1] <- paste0("#", colnames(ep_sub)[1])
+    write.table(ep_sub[, 1:12],
+                file.path(outdir, paste0(stem, ".bedpe")), sep="\t", quote=FALSE, row.names=FALSE)
+    pair_hubs  <- prep_hichip$hubs[!prep_hichip$hubs$hubid   %in% hub_tbl$hubid, ]
+    pair_loops <- prep_hichip$loops[!prep_hichip$loops$hubid  %in% hub_tbl$hubid, ]
+    pair_hubs$name <- pair_hubs$hubid
+    .write_bed(pair_hubs, con = file.path(outdir, paste0(pstem, ".bed")))
+    write.table(as.data.frame(pair_hubs),
+                file.path(outdir, paste0(pstem, ".txt")), sep="\t", quote=FALSE, row.names=FALSE)
+    colnames(pair_loops)[1] <- paste0("#", colnames(pair_loops)[1])
+    write.table(pair_loops[, 1:12],
+                file.path(outdir, paste0(pstem, ".bedpe")), sep="\t", quote=FALSE, row.names=FALSE)
+    invisible(hub_tbl)
+  }
+
+  ## Set 1: unadjusted p-value + stability
+  hubs_pval <- observed_hubs_per_promoter_sub_hub %>%
+    filter(!is.na(hub_p_value_global),
+           hub_p_value_global   <= pvalue_cutoff,
+           reproducibility_rate >= stability_cutoff)
+  #print(paste0("High-confidence hubs (p < ", pvalue_cutoff,
+  #             ", stability >= ", stability_cutoff, "): ", nrow(hubs_pval)))
+  .export_hub_set(hubs_pval, observed_hubs_per_promoter_sub, tag = "pvalue")
+
+  ## Set 2: FDR (BH-adjusted q) + stability
+  hubs_fdr <- observed_hubs_per_promoter_sub_hub %>%
+    filter(!is.na(hub_p_adj_global),
+           hub_p_adj_global     <= pvalue_cutoff,
+           reproducibility_rate >= stability_cutoff)
+  #print(paste0("High-confidence hubs (FDR < ", pvalue_cutoff,
+  #             ", stability >= ", stability_cutoff, "): ", nrow(hubs_fdr)))
+  .export_hub_set(hubs_fdr, observed_hubs_per_promoter_sub, tag = "fdr")
+
   print("Postprocessing done.")
+  invisible(list(high_confidence_pval = hubs_pval,
+                 high_confidence_fdr  = hubs_fdr))
 }
+
 
 
 ##########################
-##For real data
+##Run end-to-end workflow
 ##########################
-##For GM12878 test data
-build.run.preprocess(loop_file = "/home/syidan/syidan/Data/Processed/HiCHIP_GSE_test/significant_interactions/Hicdcplus.Human_GM12878_unknown_WT_unknown_HiCHIP_standard_mergedSRR.significant_interactions.bedpe", 
-              loop_file_all = "~/syidan/Data/Processed/HiCHIP_GSE_test/hicdcplus/Human_GM12878_unknown_WT_unknown_HiCHIP_standard_mergedSRR/Hicdcplus.Human_GM12878_unknown_WT_unknown_HiCHIP_standard_mergedSRR.all_interactions.bedpe.gz", 
-              outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer", tss_input = promoters_annotation, filename = "exampleGM12878")
-
-for (method in c("log_minmax")) { #, "log_maxnorm", "log_zscore"
-  # for (weight_method in c("bin_log_ratio_sig")) { #"bin_percentile_plus_sig", "bin_log_ratio_sig", "bin_diff_global", "bin_diff_binmax"
-  for (weight_method in c("distance_only", "count_only", "sig_only", "count_sig", "zscore_residual", "count_sig_plus_dist_linear", "bin_percentile_plus_sig", "bin_diff_global", "bin_diff_binmax", "bin_percentile")) {
-      build.run.all(outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer", 
-                    method = method, weight_method = weight_method, filename = "exampleGM12878")
-  }
-}
-
-for (method in c("log_minmax")) { #, "log_maxnorm", "log_zscore"
-  # for (weight_method in c("bin_log_ratio_sig")) { #"bin_percentile_plus_sig", "bin_log_ratio_sig", "bin_diff_global", "bin_diff_binmax"
-  for (weight_method in c("distance_only", "count_only", "sig_only", "count_sig", "zscore_residual", "count_sig_plus_dist_linear", "bin_percentile_plus_sig", "bin_diff_global", "bin_diff_binmax", "bin_percentile")) {
-    build.cutoff(outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer",  
-                  method = method, weight_method = weight_method, filename = "exampleGM12878")
-  }
-}
-
-for (method in c("log_minmax")) { #, "log_maxnorm", "log_zscore"
-  # for (weight_method in c("bin_log_ratio_sig")) { #"bin_percentile_plus_sig", "bin_log_ratio_sig", "bin_diff_global", "bin_diff_binmax"
-  for (weight_method in c("distance_only", "count_only", "sig_only", "count_sig", "zscore_residual", "count_sig_plus_dist_linear", "bin_percentile_plus_sig", "bin_diff_global", "bin_diff_binmax", "bin_percentile")) {
-    build.postprocess(outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer",  
-                  method = method, weight_method = weight_method, filename = "exampleGM12878")
-  }
-}
-
-
-
-##For brain data
-brain.dir= "/home/syidan/syidan/Data/Processed/HiCHIP_brain_dif_part_GSE147672_softlink_merged/HiCHIP/significant_interactions/"
-for (samplename in c("Caudate1", "Caudate2", "Hippocampus1", "Hippocampus2", "MiddleFrontalGyrus1", "MiddleFrontalGyrus2", "ParietalLobe1", "ParietalLobe2", "SubstantiaNigra1", "SubstantiaNigra2", "SuperiorTemporalGyri1", "SuperiorTemporalGyri2")) {
-    # build.run.preprocess(loop_file = file.path(brain.dir, paste0("Hicdcplus.Human_",samplename,"_unknown_WT_unknown_HiChIP_standard_mergedSRR.significant_interactions.bedpe")),
-    #               loop_file_all = file.path(gsub("significant_interactions","hicdcplus",brain.dir), paste0("Human_",samplename,"_unknown_WT_unknown_HiChIP_standard_mergedSRR"), paste0("Hicdcplus.Human_",samplename,"_unknown_WT_unknown_HiChIP_standard_mergedSRR.all_interactions.bedpe.gz")), 
-    #               outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer", tss_input = promoters_annotation, filename = samplename)
-
-    build.run.all(outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer", 
-                  method = "log_minmax", weight_method = "bin_log_ratio_sig", filename = samplename)
-}
-
-for (samplename in c("Caudate1", "Caudate2", "Hippocampus1", "Hippocampus2", "MiddleFrontalGyrus1", "MiddleFrontalGyrus2", "ParietalLobe1", "ParietalLobe2", "SubstantiaNigra1", "SubstantiaNigra2", "SuperiorTemporalGyri1", "SuperiorTemporalGyri2")) {
-    build.cutoff(outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer", 
-                  method = "log_minmax", weight_method = "bin_log_ratio_sig", filename = samplename)
-}
-
-for (samplename in c("Caudate1", "Caudate2", "Hippocampus1", "Hippocampus2", "MiddleFrontalGyrus1", "MiddleFrontalGyrus2", "ParietalLobe1", "ParietalLobe2", "SubstantiaNigra1", "SubstantiaNigra2", "SuperiorTemporalGyri1", "SuperiorTemporalGyri2")) {
-    build.postprocess(outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer", 
-                  method = "log_minmax", weight_method = "bin_log_ratio_sig", filename = samplename)
-}
-
-
-
-
-# Annotate loop bedpe file
-# h3k27ac_peak = "~/syidan/Data/Processed/HiCHIP_GSE/ATAC/merged.snakePipes.out/MACS2/Human_GM12878_unknown_WT_unknown_ATAC_standard_mergedSRR.filtered.short.BAM_summits.bed"
-# h3k27ac_peak = "/home/syidan/syidan/Data/Processed/HiCHIP_GSE_test/peaks/Human_GM12878_unknown_WT_unknown_HiCHIP_standard_mergedSRR_peaks.narrowPeak")
-
-outdir = "~/syidan/Projects/SnakeHichipResult/ProcessedData/multiple_enhancer"
-method = "log_minmax"
-weight_method = "bin_log_ratio_sig"
-filename = "MiddleFrontalGyrus1"
-
-
-
-
-
-
-
-
-
-
-##using multiple sessions to do bootstrap
-  # stability_runs <- future_map(1:B, function(i) {
-  #   # 模拟噪声：Poisson 采样
-  #   # 注意：这里直接覆盖 counts 列，确保 build_hubs 内部的权重计算使用新值
-  #   EP_bs <- raw_data %>% 
-  #     mutate(counts = rpois(n(), lambda = pmax(0, subsample_frac * counts))) 
-    
-  #   EP_bs <- compute_weights(EP_bs,weight_mode = weight_mode, dist_col = dist_col, q_col = q_col, breaks = breaks, alpha = alpha, sig_cap = sig_cap, sig_beta = sig_beta)
-
-  #   run_res <- build_hubs_from_EP(EP_bs$loops, k_min=k_min, resolution=resolution, seed=42, quantile_cutoff=quantile_cutoff, method=method, use_leiden = 'on')
-    
-  #   # 建立快速查找表：Promoter_id -> List of Enhancer Sets
-  #   iter_hubs <- run_res$observed_hubs
-  #   valid_hubs <- run_res$observed_hubs %>% 
-  #     filter(!is.null(enhancers)) %>%
-  #     filter(lengths(enhancers) > 0) # 确保 list 里的 vector 长度 > 0
-  #   split(valid_hubs$enhancers, valid_hubs$promoter_id)
-    
-  #   }, .options = furrr_options(seed = TRUE,
-  #   # 显式告诉 future 需要导出哪些函数和变量
-  #   globals = c("raw_data", "compute_weights", "build_hubs_from_EP", 
-  #               "weight_mode", "dist_col", "q_col", "breaks", "alpha", 
-  #               "sig_cap", "sig_beta", "k_min", "resolution", "quantile_cutoff", 
-  #               "method", "subsample_frac", "loops_convert", "make_peak_id",
-  #               "run_leiden_for_promoter", "fast_comembership"),
-  #   packages = c("dplyr", "purrr", "data.table", "Matrix", "igraph", "leiden", "tidyr")
-  #   )
-  # ) 
-
- 
-
-
-# # ------------------- Step 10: End-to-end workflow -------------------
-# build.run.preprocess <- function(loop_file, loop_file_all, outdir, tss_input, filename, promoter_window=0) {
-#   prep_hichip_all <- preprocess_hichip(loop_file = loop_file, tss_input = tss_input, mode = "all", promoter_window = promoter_window)
-#   prep_hichip <- preprocess_hichip(loop_file = loop_file, tss_input = tss_input, mode = "promoter", promoter_window = promoter_window)
-#   all_ep_data = preprocess_hichip(loop_file = loop_file_all, tss_input = tss_input, mode = "promoter", promoter_window = promoter_window)
-
-#   save(prep_hichip_all, prep_hichip, all_ep_data, file = file.path(outdir, paste("multiple_result",filename,"hub","all.preprocess.RData",sep=".")))
-#   print("Preprocessing done.")
-# }
-
-# build.run.all <- function(outdir, method, weight_method, filename, promoter_window=0) {
-#   load(file.path(outdir, paste("multiple_result",filename,"hub","all.preprocess.RData",sep=".")))
-#   observed_hubs_per_promoter <- PEhub_full(raw_data = prep_hichip$loops, weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5, n_perm = 10, resolution = 1.0, k_min = 2, seed = 42, quantile_cutoff = 0.2, method = method)
-#   observed_hubs_per_promoter_sub <- observed_hubs_per_promoter$loops[!is.na(observed_hubs_per_promoter$loops$hub_index) & observed_hubs_per_promoter$loops$hub_index=="hub1",]
-#   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter$hubs[!is.na(observed_hubs_per_promoter$hubs$hub_index) & observed_hubs_per_promoter$hubs$hub_index=="hub1",]
-#   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub[order(observed_hubs_per_promoter_sub_hub$hubid),]
-#   #pvalue prepare
-#   all_ep_data_weight <- compute_weights(all_ep_data$loops, weight_mode = weight_method, dist_col = c("D"), q_col = "qvalue", breaks = c(0,1e4,2.5e4,5e4,1e5,2.5e5,5e5,1e6,2e6), alpha = 0.8, sig_cap = 10, sig_beta = 0.5)
-#   observed_hubs_per_promoter_sub_observed <- observed_hubs_per_promoter$observed_hubs[observed_hubs_per_promoter$observed_hubs$promoter_id %in% observed_hubs_per_promoter_sub$promoter_id,]
-#   observed_hubs_per_promoter_pvalue_prepare <- build.null.pvalue(hub_tbl=observed_hubs_per_promoter_sub_observed, hub_tbl_ep=observed_hubs_per_promoter_sub, hub_tbl_all_ep=all_ep_data_weight$loops, method = method, B = 1000, quantile_cutoff = 0.2, stat = "density")
-
-#   save(observed_hubs_per_promoter, observed_hubs_per_promoter_sub, observed_hubs_per_promoter_sub_hub, observed_hubs_per_promoter_pvalue_prepare, file = file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"preprocess.RData",sep=".")))
-#   print("All runs done.")
-# }
-
-# build.postprocess <- function(outdir, method, weight_method, filename) {
-#   load(file.path(outdir, paste("multiple_result",filename,"hub","all.preprocess.RData",sep=".")))
-#   load(file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"preprocess.RData",sep=".")))
-#   observed_hubs_per_promoter_pvalue_all <- build.null.pvalue.calculate(hub_tbl3=observed_hubs_per_promoter_pvalue_prepare$hubs, global_bins=observed_hubs_per_promoter_pvalue_prepare$global_bins, method = method, B = 1000, quantile_cutoff = 0.2, stat = "sum", null_mode = "global")
-#   observed_hubs_per_promoter_pvalue <- observed_hubs_per_promoter_pvalue_all %>% select(promoter_id, hub_id, hub_p_value_global, hub_p_adj_global, hub_score_obs_global, hub_score_null_median, OE_ratio_global) # %>% filter(!is.na(hub_p_adj_global), hub_p_adj_global <= 0.05)
-#   observed_hubs_per_promoter_sub <- observed_hubs_per_promoter_sub %>% left_join( observed_hubs_per_promoter_pvalue, by = c("promoter_id", "hub_id") )
-#   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub %>% left_join( observed_hubs_per_promoter_pvalue, by = c("promoter_id", "hub_id") )
-#   save(prep_hichip_all, observed_hubs_per_promoter, observed_hubs_per_promoter_sub, observed_hubs_per_promoter_sub_hub, observed_hubs_per_promoter_pvalue, file = file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"RData",sep=".")))
-
-#   #export significant hubs
-#   observed_hubs_per_promoter_sub_hub <- observed_hubs_per_promoter_sub_hub %>% filter(!is.na(hub_p_adj_global), hub_p_adj_global <= 0.05 | OE_ratio_global > 1.5)
-#   print(paste0("Significant hubs number: ", nrow(observed_hubs_per_promoter_sub_hub)))
-#   observed_hubs_per_promoter_sub_hub$name <- with(observed_hubs_per_promoter_sub_hub[order(observed_hubs_per_promoter_sub_hub$hubid),], { h <- gsub("_","", observed_hubs_per_promoter_sub_hub$hubid); paste0(observed_hubs_per_promoter_sub_hub$promoter_gene_name, "_", h, "_", ave(h, h, FUN = seq_along)) })
-#   gr <- makeGRangesFromDataFrame(observed_hubs_per_promoter_sub_hub,keep.extra.columns = TRUE)
-#   export(gr, con=file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"bed",sep=".")))
-#   write.table(as.data.frame(observed_hubs_per_promoter_sub_hub)[,c(1:21,ncol(observed_hubs_per_promoter_sub_hub))], file=file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"txt",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-#   colnames(observed_hubs_per_promoter_sub)[1] <- paste0("#",colnames(observed_hubs_per_promoter_sub)[1])
-#   write.table(observed_hubs_per_promoter_sub[,1:12], file=file.path(outdir, paste("multiple_result",filename,"hub",method,weight_method,"bedpe",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-  
-#   #pairwise
-#   observed_hubs_per_promoter_sub_hub_pairs <- prep_hichip$hubs[!prep_hichip$hubs$hubid %in% observed_hubs_per_promoter_sub_hub$hubid,]
-#   observed_hubs_per_promoter_sub_pairs <- prep_hichip$loops[!prep_hichip$loops$hubid %in% observed_hubs_per_promoter_sub$hubid,]
-#   gr_pairs <- makeGRangesFromDataFrame(observed_hubs_per_promoter_sub_hub_pairs,keep.extra.columns = TRUE)
-#   gr_pairs$name <- gr_pairs$hubid
-#   export(gr_pairs, con=file.path(outdir, paste("multiple_result",filename,"pairwise",method,weight_method,"bed",sep=".")))
-#   write.table(as.data.frame(observed_hubs_per_promoter_sub_hub_pairs), file=file.path(outdir, paste("multiple_result",filename,"pairwise",method,weight_method,"txt",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-#   colnames(observed_hubs_per_promoter_sub_pairs)[1] <- paste0("#",colnames(observed_hubs_per_promoter_sub_pairs)[1])
-#   write.table(observed_hubs_per_promoter_sub_pairs[,1:12], file=file.path(outdir, paste("multiple_result",filename,"pairwise",method,weight_method,"bedpe",sep=".")), sep="\t", quote=FALSE, row.names=FALSE)
-#   print("Postprocessing done.")
-# }

@@ -1,0 +1,46 @@
+name: pehub
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # Python and leidenalg (the community-detection backend)
+  - python=3.11
+  - leidenalg=0.11.0
+  - python-igraph=0.11.8
+  - numpy=1.26.4
+
+  # R and build tools
+  - r-base=4.4
+  - r-devtools
+  - r-remotes
+
+  # System libraries that R packages need to compile
+  - libxml2
+  - libcurl
+  - openssl
+  - zlib
+
+  # Core R packages from conda-forge (prebuilt, no compilation)
+  - r-data.table
+  - r-igraph
+  - r-matrix
+  - r-dplyr
+  - r-tidyr
+  - r-purrr
+  - r-tibble
+  - r-tidyselect
+  - r-rlang
+  - r-reticulate
+  - r-leiden
+  - r-furrr
+  - r-future
+  - r-progress
+  - r-r.utils
+
+  # Bioconductor packages (from bioconda, prebuilt)
+  - bioconductor-genomicranges
+  - bioconductor-iranges
+  - bioconductor-s4vectors
+  - bioconductor-rtracklayer
+  - bioconductor-basilisk

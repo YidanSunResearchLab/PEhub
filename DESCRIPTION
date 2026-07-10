@@ -1,0 +1,55 @@
+Package: PEhub
+Title: Promoter-Centric Detection of Multi-Way Enhancer Hubs from Chromatin Interaction Data
+Version: 0.1.0
+Authors@R: c(
+    person("Jiang", "Tan", email = "jiangtan@wustl.edu", role = "aut"),
+    person("Yidan", "Sun", email = "syidan@wustl.edu", role = c("aut", "cre")))
+Description: PEhub reconstructs multi-way enhancer hubs from pairwise chromatin
+    interaction data (e.g., H3K27ac HiChIP) by modelling enhancer-promoter
+    interactions as promoter-anchored weighted networks, quantifying enhancer
+    co-membership, partitioning enhancers into candidate hubs by Leiden community
+    detection, and evaluating hubs against a distance-matched null model. The
+    Python leidenalg backend is provisioned automatically via basilisk, so no
+    manual Python configuration is required.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+biocViews: Software, Epigenetics, GeneRegulation, HiC, GraphAndNetwork, Transcription
+Depends:
+    R (>= 4.3.0)
+Imports:
+    basilisk,
+    reticulate,
+    rlang,
+    igraph,
+    Matrix,
+    data.table,
+    dplyr,
+    tidyr,
+    purrr,
+    tidyselect,
+    tibble,
+    GenomicRanges,
+    IRanges,
+    S4Vectors,
+    methods,
+    stats,
+    furrr,
+    future,
+    progress,
+    R.utils,
+    utils
+Suggests:
+    rtracklayer,
+    GenomicFeatures,
+    TxDb.Hsapiens.UCSC.hg38.knownGene,
+    org.Hs.eg.db,
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+StagedInstall: no
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+URL: https://github.com/yourname/PEhub
+BugReports: https://github.com/yourname/PEhub/issues
+Config/roxygen2/version: 8.0.0

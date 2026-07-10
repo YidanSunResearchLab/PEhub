@@ -1,6 +1,6 @@
 # PEhub
 
-**PEhub** is a promoter-centric computational framework for identifying and characterizing **multi-way enhancer hubs** from HiChIP chromatin interaction data.
+**PEhub** is a R package for identifying and characterizing **multi-way enhancer hubs** from HiChIP chromatin interaction data.
 It resolves higher-order enhancer cooperation as **promoter-anchored regulatory units**, enabling quantitative analysis of hub architecture, stability, and statistical significance.
 
 ---
@@ -51,18 +51,34 @@ Instead of clustering a global chromatin interaction graph, PEhub:
 
 ## Installation
 
-### Install the package
+### Option A: conda (recommended for most users)
+
+The simplest path — conda provides R, Python, and all system libraries prebuilt,
+so nothing needs to compile:
+
+```bash
+mamba create -n pehub -c conda-forge \
+    r-base=4.4 r-devtools bioconductor-rtracklayer zlib python=3.13
+mamba activate pehub
+```
+
+Then in R:
+
+```r
+remotes::install_github("YidanSunResearchLab/PEhub")
+```
+
+### Option B: existing R installation
+
+If you already have R >= 4.4 and python >= 3.11 set up:
 
 ```r
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-
 BiocManager::install("YidanSunResearchLab/PEhub")
+BiocManager::install("rtracklayer")
 ```
 
-`BiocManager::install()` resolves both CRAN and Bioconductor dependencies, which
-PEhub needs (`GenomicRanges`, `basilisk`).
-
-### Python is handled for you
+### Python package is handled for you
 
 Community detection uses the Python `leidenalg` library. PEhub provisions an
 isolated conda environment for it automatically via
@@ -71,40 +87,6 @@ hub detection. **You never install or configure Python.**
 
 The first run takes a few minutes while that environment is built. Every run
 afterwards reuses it.
-
-### If installation fails
-
-On Linux, R packages sometimes fail to compile because a system library is
-missing. On Debian/Ubuntu, this covers nearly everything:
-
-```bash
-sudo apt install libxml2-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
-```
-
-| Error message contains | Install this |
-| --- | --- |
-| `libxml not found` | `libxml2-dev` (Debian/Ubuntu), `libxml2-devel` (RHEL) |
-| `libcurl not found` | `libcurl4-openssl-dev`, `libcurl-devel` |
-| `openssl not found` | `libssl-dev`, `openssl-devel` |
-| `zlib not found` | `zlib1g-dev`, `zlib-devel` |
-
-### Alternative: conda
-
-If you do not have root access, conda gives you everything prebuilt:
-
-```bash
-mamba create -n pehub -c conda-forge \
-    r-base=4.4 r-devtools bioconductor-rtracklayer zlib python
-mamba activate pehub
-```
-
-Then, in R:
-
-```r
-BiocManager::install("YidanSunResearchLab/PEhub")
-```
-
----
 
 ## Get the example data
 
@@ -142,11 +124,15 @@ Save this as `run_PEhub.R` and run it with `Rscript run_PEhub.R`.
 
 ```r
 #!/usr/bin/env Rscript
-library(PEhub)
+suppressPackageStartupMessages({
+  library(PEhub)
+  library(rtracklayer)
+  })
 
 ## ---- 1. Build the TSS annotation from the GTF ----
-tss <- read_tss_from_gtf("example_data/genes.chr9.gtf.gz",
-                         feature = "transcript")
+gtf <- rtracklayer::import("example_data/genes.chr9.gtf.gz")
+tx  <- gtf[gtf$type == "transcript"]
+tss <- GenomicRanges::resize(tx, width = 1, fix = "start")
 message("Got ", length(tss), " TSS records")
 
 ## ---- 2. Run all four stages ----
@@ -171,9 +157,6 @@ result <- pehub_run(
   stability_cutoff = 0.5,
   workers          = 10
 )
-
-message("High-confidence hubs (p-value): ", nrow(result$high_confidence_pval))
-message("High-confidence hubs (FDR):     ", nrow(result$high_confidence_fdr))
 ```
 
 ### What you should see
@@ -201,8 +184,8 @@ expect a few minutes. Lower `B_pvalue` (e.g. `1000`) for a faster first look.
 
 PEhub always exports **two sets of results** simultaneously:
 
-- **p-value set** (32 hubs): passes unadjusted empirical `p < 0.05` and `reproducibility_rate >= 0.5`. This is the recommended set for most analyses, as it retains reproducible hubs that are individually significant against the null model.
-- **FDR set** (7 hubs): passes Benjamini–Hochberg `q < 0.05` and `reproducibility_rate >= 0.5`. The stricter set, correcting for the number of hubs tested. Use this when a more conservative multiple-testing correction is required.
+- **p-value set** : passes unadjusted empirical `p < 0.05` and `reproducibility_rate >= 0.5`. This is the recommended set for most analyses, as it retains reproducible hubs that are individually significant against the null model.
+- **FDR set** : passes Benjamini–Hochberg `q < 0.05` and `reproducibility_rate >= 0.5`. The stricter set, correcting for the number of hubs tested. Use this when a more conservative multiple-testing correction is required.
 
 Your results are now in `results/`. Skip to [Output files](#output-files).
 
@@ -220,7 +203,10 @@ objects, so you never have to `load()` anything by hand.
 Start an R session in the cloned directory:
 
 ```r
-library(PEhub)
+suppressPackageStartupMessages({
+  library(PEhub)
+  library(rtracklayer)
+  })
 
 OUTDIR   <- "results"
 SAMPLE   <- "GM12878test"
@@ -229,18 +215,12 @@ SAMPLE   <- "GM12878test"
 ### Step 0 — Build the TSS annotation
 
 ```r
-tss <- read_tss_from_gtf("example_data/genes.chr9.gtf.gz",
-                         feature = "transcript")
 
-length(tss)
-#> [1] 197
-
-head(tss, 3)
+gtf <- rtracklayer::import("example_data/genes.chr9.gtf.gz")
+tx  <- gtf[gtf$type == "transcript"]
+tss <- GenomicRanges::resize(tx, width = 1, fix = "start")
+message("Got ", length(tss), " TSS records")
 ```
-
-`read_tss_from_gtf()` collapses each transcript to a single base pair at its 5'
-end, taking strand into account. If you prefer, supply your own `GRanges` with a
-`gene_id` metadata column.
 
 ### Step 1 — Prepare interactions
 
@@ -523,26 +503,29 @@ combine these differently.
 pehub_weight_schemes()
 ```
 
-| Code | Label | Uses |
-| --- | --- | --- |
-| `count_only` | Count | Raw contact frequency |
-| `sig_only` | Significance | −log₁₀ q, capped |
-| `distance_only` | Distance (control) | Inverse log-distance; negative control |
-| `count_sig` | Count-Significance | count × significance |
-| `count_sig_plus_dist_linear` | Count-significance-distance | Linear mix of all three |
-| `bin_percentile` | Distance-adjusted percentile | Percentile rank of count within distance bins |
-| `bin_percentile_plus_sig` | Distance-adjusted percentile-significance | The above, scaled by significance |
-| `bin_diff_global` | Distance-adjusted excess signal (global) | count − bin median, globally normalised |
-| `bin_diff_binmax` | Distance-adjusted excess signal (bin-normalized) | count − bin median, normalised by bin maximum |
-| **`bin_log_ratio_sig`** | **Distance-adjusted log-enrichment** | **log(count / bin median) × significance — the default** |
-| `zscore_residual` | Z-score residual | Standardised residual from the HiC-DC+ background model |
+Each enhancer–promoter contact is scored from three features: **contact count**,
+**statistical significance** (−log₁₀ q), and **genomic distance**. Eleven schemes
+combine these differently. Call `pehub_weight_schemes()` to retrieve this table
+as a data frame.
 
-`bin_log_ratio_sig` is the default because the log ratio of observed to expected
-counts is dimensionless, and therefore comparable across distance scales; the log
-transform also limits the influence of extreme contact counts.
+| Category | Label | Code | Formula | Description |
+| --- | --- | --- | --- | --- |
+| Single-feature | Count | `count_only` | log(count) | Raw contact frequency |
+| Single-feature | Significance | `sig_only` | −log₁₀(q) | Statistical confidence, capped |
+| Single-feature | Distance | `distance_only` | 1/log(1+d) | Distance-based weight; negative control |
+| Combined evidence | Count-Significance | `count_sig` | count × sig | Count weighted by significance |
+| Combined evidence | Count-Significance-Distance | `count_sig_plus_dist_linear` | linear combination | Linear integration of all three features |
+| Model-based | Z-score residual | `zscore_residual` | standardized residual | Standardized HiC-DC+ background residual |
+| Distance-corrected | Distance-adjusted percentile | `bin_percentile` | percentile within bin | Percentile rank of count within distance bins |
+| Distance-corrected | Distance-adjusted percentile-significance | `bin_percentile_plus_sig` | percentile × sig | Distance percentile weighted by significance |
+| Distance-corrected | Distance-adjusted excess signal | `bin_diff_global` | observed − expected | Contact excess over distance-bin expectation |
+| Distance-corrected | Distance-adjusted excess signal normalized | `bin_diff_binmax` | normalized to bin max | Bin-normalized excess signal |
+| Distance-corrected | **Distance-adjusted log-enrichment** ✓ | **`bin_log_ratio_sig`** | **log(observed/expected) × sig** | **Log enrichment over distance-bin expectation, weighted by significance — default** |
 
-`distance_only` exists as a negative control: it ignores contact strength
-entirely, and should give the weakest separation between hub classes.
+`bin_log_ratio_sig` is the default because:
+- the log ratio is **dimensionless** and comparable across distance scales
+- the log transform limits the influence of extreme contact counts
+- multiplying by significance down-weights interactions with weak statistical support
 
 ---
 
@@ -571,15 +554,6 @@ environment your earlier results came from:
 ```r
 reticulate::py_list_packages()   # in the old environment
 ```
-
-**Verifying against a reference dataset**
-
-```r
-source(system.file("verify_consistency.R", package = "PEhub"))
-```
-
-Edit the paths at the top; it reports the percentage of promoters whose hub
-composition is identical to your reference output.
 
 ---
 
@@ -628,7 +602,7 @@ help(package = "PEhub")
 
 ## Citation
 
-> Tan J.\*, Sun Y.\* PEhub reveals the hierarchical organization of multi-way
+> Tan J., Sun Y. PEhub reveals the hierarchical organization of multi-way
 > enhancer hubs in the human brain.
 
 ## License

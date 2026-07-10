@@ -1,7 +1,6 @@
 # PEhub
 
-**PEhub** is a R package for identifying and characterizing **multi-way enhancer hubs** from HiChIP chromatin interaction data.
-It resolves higher-order enhancer cooperation as **promoter-anchored regulatory units**, enabling quantitative analysis of hub architecture, stability, and statistical significance.
+**PEhub** is an R package for identifying and characterizing multi-way enhancer hubs from promoter-centered chromatin interaction data. It reconstructs higher-order enhancer–promoter regulatory hubs from pairwise chromatin interactions, enabling quantitative analysis of hub architecture, stability, and statistical significance.
 
 ---
 

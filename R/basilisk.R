@@ -15,7 +15,6 @@ NULL
   envname  = "pehub_leiden_env",
   pkgname  = "PEhub",
   packages = c(
-    "python=3.13.5",
     "leidenalg=0.10.2",
     "python-igraph=0.10.8",
     "numpy=1.26.4"

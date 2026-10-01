@@ -10,7 +10,9 @@ pehub_prepare_interactions(
   outdir,
   tss_input,
   filename,
-  promoter_window = 0
+  promoter_window = 0,
+  n_cells = NA_integer_,
+  check_power = TRUE
 )
 }
 \arguments{
@@ -28,10 +30,24 @@ build the distance-matched null pool.}
 
 \item{promoter_window}{Half-width, in bp, of the promoter window around each
 TSS. \code{0} treats the TSS itself as the promoter (default).}
+
+\item{n_cells}{Optional. Number of single cells/nuclei pooled to produce
+\code{loop_file_all}, if the input comes from a pooled single-cell/
+single-nucleus assay. Passed through to \code{\link{pehub_check_power}};
+purely informational (see that function for why raw cell count isn't
+itself used as a threshold).}
+
+\item{check_power}{If \code{TRUE} (default), run \code{\link{pehub_check_power}}
+on \code{loop_file_all} before preprocessing and attach its result as
+\code{$power_check}. Does not change any computation or block execution;
+set to \code{FALSE} to skip it (e.g. for deeply-sequenced bulk input
+where the check is redundant).}
 }
 \value{
-Invisibly, a list with \code{prep_hichip} (significant EP tables) and
-\code{all_ep_data} (background EP tables). Also writes
+Invisibly, a list with \code{prep_hichip} (significant EP tables),
+\code{all_ep_data} (background EP tables), and, unless
+\code{check_power = FALSE}, \code{power_check} (the result of
+\code{\link{pehub_check_power}}). Also writes
 \code{multiple_result.<filename>.hub.all.preprocess.RData} to \code{outdir}.
 }
 \description{
@@ -41,5 +57,6 @@ the promoter-anchored enhancer-promoter (EP) interaction tables used by all
 downstream stages.
 }
 \seealso{
-\code{\link{pehub_detect_hubs}} for the next stage.
+\code{\link{pehub_detect_hubs}} for the next stage;
+\code{\link{pehub_check_power}} for the depth/power pre-flight check.
 }

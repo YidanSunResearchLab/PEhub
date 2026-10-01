@@ -25,7 +25,6 @@ Useful links:
 
 Authors:
 \itemize{
-  \item Yidan Sun \email{syidan@wustl.edu}
   \item Jiang Tan \email{jiangtan@wustl.edu}
 }
 

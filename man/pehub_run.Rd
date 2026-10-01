@@ -21,7 +21,9 @@ pehub_run(
   null_mode = "hist_matched",
   pvalue_cutoff = 0.05,
   stability_cutoff = 0.5,
-  workers = 1
+  workers = 1,
+  n_cells = NA_integer_,
+  check_power = TRUE
 )
 }
 \arguments{
@@ -56,6 +58,18 @@ thresholds are applied in \code{\link{pehub_export_hubs}}.}
 \item{workers}{Number of parallel workers for the null model. Requires the
 \pkg{future} and \pkg{furrr} packages; if absent, runs serially with
 identical results.}
+
+\item{n_cells}{Optional. Number of single cells/nuclei pooled to produce
+\code{loop_file_all}, if the input comes from a pooled single-cell/
+single-nucleus assay. Passed through to \code{\link{pehub_check_power}};
+purely informational (see that function for why raw cell count isn't
+itself used as a threshold).}
+
+\item{check_power}{If \code{TRUE} (default), run \code{\link{pehub_check_power}}
+on \code{loop_file_all} before preprocessing and attach its result as
+\code{$power_check}. Does not change any computation or block execution;
+set to \code{FALSE} to skip it (e.g. for deeply-sequenced bulk input
+where the check is redundant).}
 
 \item{use_adjusted_p}{See \code{\link{pehub_export_hubs}}.}
 }

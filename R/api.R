@@ -24,17 +24,43 @@
 #' @param filename Sample name; used as a prefix for all output files.
 #' @param promoter_window Half-width, in bp, of the promoter window around each
 #'   TSS. \code{0} treats the TSS itself as the promoter (default).
+#' @param n_cells Optional. Number of single cells/nuclei pooled to produce
+#'   \code{loop_file_all}, if the input comes from a pooled single-cell/
+#'   single-nucleus assay. Passed through to \code{\link{pehub_check_power}};
+#'   purely informational (see that function for why raw cell count isn't
+#'   itself used as a threshold).
+#' @param check_power If \code{TRUE} (default), run \code{\link{pehub_check_power}}
+#'   on \code{loop_file_all} before preprocessing and attach its result as
+#'   \code{$power_check}. Does not change any computation or block execution;
+#'   set to \code{FALSE} to skip it (e.g. for deeply-sequenced bulk input
+#'   where the check is redundant).
 #'
-#' @return Invisibly, a list with \code{prep_hichip} (significant EP tables) and
-#'   \code{all_ep_data} (background EP tables). Also writes
+#' @return Invisibly, a list with \code{prep_hichip} (significant EP tables),
+#'   \code{all_ep_data} (background EP tables), and, unless
+#'   \code{check_power = FALSE}, \code{power_check} (the result of
+#'   \code{\link{pehub_check_power}}). Also writes
 #'   \code{multiple_result.<filename>.hub.all.preprocess.RData} to \code{outdir}.
 #'
-#' @seealso \code{\link{pehub_detect_hubs}} for the next stage.
+#' @seealso \code{\link{pehub_detect_hubs}} for the next stage;
+#'   \code{\link{pehub_check_power}} for the depth/power pre-flight check.
 #' @export
 pehub_prepare_interactions <- function(loop_file, loop_file_all, outdir,
                                        tss_input, filename,
-                                       promoter_window = 0) {
+                                       promoter_window = 0,
+                                       n_cells = NA_integer_,
+                                       check_power = TRUE) {
   dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+  power_check <- NULL
+  if (isTRUE(check_power)) {
+    power_check <- tryCatch(
+      pehub_check_power(loop_file_all, n_cells = n_cells),
+      error = function(e) {
+        message("pehub_check_power() failed (continuing without it): ", conditionMessage(e))
+        NULL
+      })
+  }
+
   build.run.preprocess(loop_file       = loop_file,
                        loop_file_all   = loop_file_all,
                        outdir          = outdir,
@@ -46,7 +72,7 @@ pehub_prepare_interactions <- function(loop_file, loop_file_all, outdir,
   e <- new.env(parent = emptyenv())
   load(file.path(outdir, paste("multiple_result", filename, "hub",
                                "all.preprocess.RData", sep = ".")), envir = e)
-  res <- list(prep_hichip = e$prep_hichip, all_ep_data = e$all_ep_data)
+  res <- list(prep_hichip = e$prep_hichip, all_ep_data = e$all_ep_data, power_check = power_check)
   message("Stage 1 complete: ", nrow(res$prep_hichip$loops),
           " significant EP interactions across ",
           length(unique(res$prep_hichip$loops$promoter_id)), " promoters.")
@@ -259,7 +285,9 @@ pehub_run <- function(loop_file, loop_file_all, outdir, tss_input, filename,
                       null_mode        = "hist_matched",
                       pvalue_cutoff    = 0.05,
                       stability_cutoff = 0.5,
-                      workers          = 1) {
+                      workers          = 1,
+                      n_cells          = NA_integer_,
+                      check_power      = TRUE) {
 
   if (workers > 1) {
     if (requireNamespace("future", quietly = TRUE) &&
@@ -272,7 +300,7 @@ pehub_run <- function(loop_file, loop_file_all, outdir, tss_input, filename,
   }
 
   pehub_prepare_interactions(loop_file, loop_file_all, outdir, tss_input,
-                             filename, promoter_window)
+                             filename, promoter_window, n_cells, check_power)
   pehub_detect_hubs(outdir, filename, weight_method, method, k_min, resolution,
                     quantile_cutoff, B_pvalue, promoter_window)
   pehub_evaluate_hubs(outdir, filename, weight_method, method, k_min, resolution,

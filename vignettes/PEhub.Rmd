@@ -67,6 +67,65 @@ result <- pehub_run(
 head(result$high_confidence)
 ```
 
+# Single-cell / pooled low-depth input
+
+PEhub's background model, weighting schemes and null-model permutation testing
+were developed and validated on deeply sequenced bulk HiChIP and Pore-C data
+(paired human-heart H3K27ac HiChIP samples; GM12878 Pore-C), where "pooled"
+effectively means millions of input cells sequenced to high depth in a single
+library. Nothing about PEhub's reconstruction logic is specific to that
+regime — it exists precisely to recombine the single enhancer-promoter
+contact each individual cell shows (proximity ligation only ever joins a
+promoter to one of its enhancers at a time) into a population-level hub — but
+the method's statistical calibration assumes the pool is large and deep.
+
+If your `loop_file_all` instead comes from pooling a modest number of single
+cells or nuclei (for example a single-cell/single-nucleus Hi-C-type assay,
+one donor or one condition at a time), run a pre-flight check before trusting
+hub calls, especially at longer genomic distances:
+
+```{r}
+pehub_check_power("all_interactions.bedpe.gz", n_cells = 66)
+```
+
+This prints, and returns, a flag:
+
+* `"ok"` — depth looks adequate across all tested distance bins.
+* `"low_power"` — total depth is below a threshold at which hub sizes were
+  observed to collapse to the `k_min` floor in real single-donor calibration
+  data, rather than forming a real distribution. Treat hub sizes and
+  significance calls with caution, and avoid comparing hub counts/sizes
+  across samples that differ substantially in this total.
+* `"long_range_unreliable"` — overall depth is adequate, but one or more
+  distance bins beyond ~50kb (the range most relevant to real enhancer-hub
+  architecture, as opposed to short-range/proximal contacts) have too few
+  reads for the background model to be numerically reliable there, even
+  though it may still be fine at short range.
+
+`pehub_prepare_interactions()` (and therefore `pehub_run()`) calls this check
+automatically by default (`check_power = TRUE`) and attaches the result as
+`$power_check` on its return value — set `check_power = FALSE` to skip it,
+e.g. for input you already know is deeply sequenced bulk data.
+
+```{r}
+prep <- pehub_prepare_interactions(
+  loop_file     = "significant_interactions.bedpe",
+  loop_file_all = "all_interactions.bedpe.gz",
+  outdir        = "results/",
+  tss_input     = tss,
+  filename      = "donor1",
+  n_cells       = 66
+)
+prep$power_check$overall_flag
+```
+
+This check does not change any downstream computation — it is a diagnostic,
+not a correction. A `"low_power"` or `"long_range_unreliable"` flag does not
+mean PEhub refuses to run; it means the resulting hub calls should be
+interpreted with the same caution a shallow bulk sample would warrant, and
+compared across samples only after confirming they are in a similar depth
+regime (or after explicit depth-matching upstream).
+
 # Running the stages separately
 
 Each stage returns its key objects, so intermediate results can be inspected
